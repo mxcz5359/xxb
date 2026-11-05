@@ -32,6 +32,27 @@ class TelegramAPI
     }
 
     /**
+     * 发送"正在输入/正在上传图片"等状态
+     */
+    public function sendChatAction(int $chatId, string $action): ?array
+    {
+        return $this->request('sendChatAction', ['chat_id' => $chatId, 'action' => $action]);
+    }
+
+    /**
+     * 上传并发送一张图片 (二进制内容)
+     */
+    public function sendPhoto(int $chatId, string $content, string $mime, array $options = []): ?array
+    {
+        $ext = explode('/', $mime)[1] ?? 'png';
+        $fields = ['chat_id' => (string)$chatId, 'photo' => new \CURLStringFile($content, "image.{$ext}", $mime)];
+        foreach ($options as $key => $value) {
+            $fields[$key] = is_array($value) ? json_encode($value, JSON_UNESCAPED_UNICODE) : (string)$value;
+        }
+        return $this->request('sendPhoto', $fields, true, 60);
+    }
+
+    /**
      * 编辑消息文本
      */
     public function editMessageText(int $chatId, int $messageId, string $text, array $options = []): ?array
@@ -104,16 +125,20 @@ class TelegramAPI
      * @param array $params 请求参数
      * @return array|null 成功时返回 API 响应数组，失败时返回 null
      */
-    private function request(string $method, array $params = []): ?array
+    private function request(string $method, array $params = [], bool $multipart = false, int $timeout = 10): ?array
     {
         $ch = curl_init();
 
         curl_setopt($ch, CURLOPT_URL, "{$this->apiUrl}/{$method}");
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($ch, CURLOPT_POST, true);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($params));
-        curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+        if ($multipart) {
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $params);
+        } else {
+            curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($params));
+            curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+        }
+        curl_setopt($ch, CURLOPT_TIMEOUT, $timeout);
         
         $responseJson = curl_exec($ch);
         $curlError = curl_error($ch);
@@ -126,7 +151,7 @@ class TelegramAPI
 
         $response = json_decode($responseJson, true);
 
-        if (!$response['ok']) {
+        if (!is_array($response) || empty($response['ok'])) {
             $this->logger?->error('TelegramAPI: API 返回错误', [
                 'method' => $method,
                 'error_code' => $response['error_code'] ?? 'N/A',

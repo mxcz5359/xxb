@@ -80,72 +80,104 @@ class ToolService
     }
 
     /**
-     * 执行搜索查询
-     *
-     * @param string $query
-     * @return string|null 搜索结果
+     * 搜索服务提供方: tavily | searxng，未配置时返回 null
      */
+    public function getSearchProvider(): ?string
+    {
+        $search = $this->config['tools']['search'] ?? [];
+        $provider = $search['provider'] ?? '';
+        if ($provider === '' && !empty($this->config['tools']['searxng_url'])) {
+            $provider = 'searxng'; // 兼容旧配置 tools.searxng_url
+        }
+        if ($provider === 'tavily' && !empty($search['tavily_api_key'])) {
+            return 'tavily';
+        }
+        if ($provider === 'searxng' && ($search['searxng_url'] ?? $this->config['tools']['searxng_url'] ?? '') !== '') {
+            return 'searxng';
+        }
+        return null;
+    }
+
     /**
-     * 准备一个用于SearxNG搜索的cURL句柄
+     * 准备一个用于联网搜索的cURL句柄
      * @return \CurlHandle|null
      */
     public function prepareSearch(string $query): ?object
     {
-        $apiUrl = $this->config['tools']['searxng_url'] ?? null;
-        if (!$apiUrl) {
-            $this->logger?->error('ToolService: SearxNG 的 URL 未在配置中设置');
+        $search = $this->config['tools']['search'] ?? [];
+        $provider = $this->getSearchProvider();
+        if ($provider === null) {
+            $this->logger?->error('ToolService: 搜索服务未配置 (tools.search)');
             return null;
         }
 
-        $requestUrl = rtrim($apiUrl, '/') . '/search?q=' . urlencode($query) . '&format=json';
-        
         $ch = curl_init();
-        curl_setopt($ch, CURLOPT_URL, $requestUrl);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($ch, CURLOPT_TIMEOUT, 20);
+
+        if ($provider === 'tavily') {
+            curl_setopt($ch, CURLOPT_URL, 'https://api.tavily.com/search');
+            curl_setopt($ch, CURLOPT_POST, true);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode([
+                'query' => $query,
+                'max_results' => (int)($search['max_results'] ?? 5),
+                'include_answer' => true,
+            ], JSON_UNESCAPED_UNICODE));
+            curl_setopt($ch, CURLOPT_HTTPHEADER, [
+                'Content-Type: application/json',
+                'Authorization: Bearer ' . $search['tavily_api_key'],
+            ]);
+            return $ch;
+        }
+
+        $apiUrl = $search['searxng_url'] ?? $this->config['tools']['searxng_url'];
+        $requestUrl = rtrim($apiUrl, '/') . '/search?q=' . urlencode($query) . '&format=json';
+        curl_setopt($ch, CURLOPT_URL, $requestUrl);
         curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-        
-        $headers = [
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
             'Accept: application/json',
             'Accept-Language: en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7',
             'Connection: keep-alive',
-        ];
-        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+        ]);
 
         return $ch;
     }
 
     /**
-     * 解析SearxNG的cURL响应
+     * 解析搜索响应 (Tavily 与 SearxNG 的 results 结构一致: title / content / url)
      */
-    public function processSearchResult(string $responseJson, string $query, int $httpCode, string $error): string
+    public function processSearchResult($responseJson, string $query, int $httpCode, string $error): string
     {
-        if ($responseJson === false) {
-            $this->logger?->error('ToolService: 调用 SearxNG API 失败', ['query' => $query, 'error' => $error]);
+        if (!is_string($responseJson) || $responseJson === '') {
+            $this->logger?->error('ToolService: 调用搜索 API 失败', ['query' => $query, 'error' => $error]);
             return "搜索失败: " . $error;
         }
 
         if ($httpCode !== 200) {
-            $this->logger?->error('ToolService: SearxNG API 返回非200状态码', ['query' => $query, 'http_code' => $httpCode, 'response' => $responseJson]);
+            $this->logger?->error('ToolService: 搜索 API 返回非200状态码', ['query' => $query, 'http_code' => $httpCode, 'response' => $responseJson]);
             return "搜索失败: 搜索引擎返回状态码 " . $httpCode;
         }
 
         $data = json_decode($responseJson, true);
 
         if (json_last_error() !== JSON_ERROR_NONE) {
-            $this->logger?->error('ToolService: 解析 SearxNG 响应失败', ['query' => $query, 'error' => json_last_error_msg(), 'response' => $responseJson]);
+            $this->logger?->error('ToolService: 解析搜索响应失败', ['query' => $query, 'error' => json_last_error_msg(), 'response' => $responseJson]);
             return "搜索服务暂时不可用，无法解析搜索引擎的响应。";
         }
 
         if (empty($data['results'])) {
-            $this->logger?->info('ToolService: SearxNG搜索无结果', ['query' => $query]);
+            $this->logger?->info('ToolService: 搜索无结果', ['query' => $query]);
             return "没有找到与 '{$query}' 相关的结果。";
         }
 
         $formattedResult = "关于“{$query}”的搜索结果摘要：\n";
+        if (!empty($data['answer']) && is_string($data['answer'])) {
+            $formattedResult .= "简要答案: {$data['answer']}\n";
+        }
+        $maxResults = (int)($this->config['tools']['search']['max_results'] ?? 5);
         $count = 0;
         foreach ($data['results'] as $result) {
-            if ($count >= 5) break;
+            if ($count >= $maxResults) break;
             $title = $result['title'] ?? '无标题';
             $content = $result['content'] ?? '无摘要';
             $url = $result['url'] ?? '#';
@@ -158,7 +190,7 @@ class ToolService
 
     public function search(string $query): ?string
     {
-        $this->logger?->info('ToolService: 开始执行(串行)SearxNG搜索', ['query' => $query]);
+        $this->logger?->info('ToolService: 开始执行(串行)搜索', ['query' => $query]);
 
         $ch = $this->prepareSearch($query);
         if (!$ch) {
@@ -171,7 +203,7 @@ class ToolService
         curl_close($ch);
 
         $result = $this->processSearchResult($responseJson, $query, $httpCode, $error);
-        $this->logger?->info('ToolService: (串行)SearxNG搜索成功完成', ['query' => $query]);
+        $this->logger?->info('ToolService: (串行)搜索完成', ['query' => $query]);
         return $result;
     }
 
