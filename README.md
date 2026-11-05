@@ -13,11 +13,10 @@
 - **图片识别**：支持对发送到群组的图片进行解析和描述，使 AI 能够理解并讨论图片内容。
 - **定时任务 (Cron)**：内置定时报告、主动打招呼等功能，增强机器人的互动性和可维护性。
 - **多存储驱动**：支持本地文件（JSON）和 Redis 两种存储方式。
-- **【饼】 扩展工具 (Tools)**：内置并行工具执行引擎，支持搜索引擎 (SearxNG)、网页内容抓取 (Fetch)、IP 质量查询及定时器管理等功能。（这个功能原本是有的，网关稳定性太差和部署难度暂时移除）
+- **联网搜索**：回复模型可按需调用搜索 (Tavily 或自建 SearxNG) 和网页抓取，基于实时信息回答。
+- **画图**：用户要求画图时，回复模型调用 OpenAI 兼容的图片生成接口，把图片和回复一起发到群里。
 
 ## 🛜 快速开始
-
-- Tips：由于安全性隐患（你也不想Bot会彻底疯狂毁掉你的环境吧?）和稳定性考虑，暂时没有实现tool具体逻辑
 
 - 配置 `config.php`
 - 修改 `system_prompt/`(系统提示词,如果有需要) 和 `prompt.txt`(人设提示词)
@@ -55,6 +54,8 @@ cd xxb
 
 - 设置 `worker.secret`（必填，worker 内部调用密钥，可用 `php -r "echo bin2hex(random_bytes(32));"` 生成），未设置时 `request_chat.php` / `request_curl.php` 会拒绝所有请求。
 - 建议设置 `telegram.webhook_secret`，用于校验请求确实来自 Telegram。
+- (可选) 联网搜索：设置 `tools.search.provider` 为 `tavily`（填 `tavily_api_key`）或 `searxng`（填 `searxng_url`，SearxNG 需开启 json 输出）。配置了 `worker.curl_url` 时还会启用网页抓取。
+- (可选) 画图：设置 `tools.image_generation.enabled` 为 `true`，并填写 OpenAI 兼容的 `/images/generations` 接口地址、密钥和模型。
 
 ### 4. 设置 Webhook
 将你的 Webhook 地址指向 `main_chat.php`（`secret_token` 填 `telegram.webhook_secret` 的值）：

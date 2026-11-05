@@ -33,6 +33,7 @@ use ChatBot\Business\SystemPromptManager;
 use ChatBot\Business\KnowledgeBaseManager;
 use ChatBot\Services\ToolService;
 use ChatBot\Services\ToolExecutor;
+use ChatBot\Services\ImageService;
 
 $config = require __DIR__ . '/config.php';
 
@@ -96,6 +97,7 @@ function initialize_services(array $config, Logger $logger): array
         'systemPromptManager' => new SystemPromptManager($config['paths'], $logger),
         'toolService' => new ToolService($config, $logger),
         'toolExecutor' => new ToolExecutor(new ToolService($config, $logger), $logger),
+        'imageService' => new ImageService($config, $logger),
         'knowledgeManager' => new KnowledgeBaseManager($config, $logger),
     ];
 }
@@ -127,6 +129,7 @@ function handle_message(array $message, array $config, Logger $logger): void
         $systemPromptManager = $services['systemPromptManager'];
         $toolService = $services['toolService'];
         $toolExecutor = $services['toolExecutor'];
+        $imageService = $services['imageService'];
         $knowledgeManager = $services['knowledgeManager'];
 
         $userId = (int)$message['from']['id'];
@@ -369,10 +372,69 @@ function handle_message(array $message, array $config, Logger $logger): void
 
     $replyFunction = ($action === 'REPLY_PRO') ? 'reply_pro' : 'reply';
     $replyMessages = build_reply_messages($localContext);
-    $replyApiStartTime = $enableTimeCount ? microtime(true) : 0;
-    $rawReply = $ai->generateReply($replyFunction, '', $prompt, $replyMessages);
-    if ($enableTimeCount) {
-        $logger->debug('Reply API调用完成', ['time_spent' => round(microtime(true) - $replyApiStartTime, 3) . 's', 'function' => $replyFunction], $chatId);
+
+    $availableTools = get_available_tools($config, $toolService, $imageService);
+    if ($availableTools) {
+        $prompt .= "\n\n" . build_tool_instructions($availableTools);
+    }
+
+    // 工具调用循环：模型输出 <tool_call> 时执行工具并把结果回传，直到模型给出最终回复
+    $maxToolRounds = max(0, (int)($config['tools']['max_rounds'] ?? 3));
+    $generatedImage = null;
+    $drawPrompt = null;
+    for ($round = 0; ; $round++) {
+        $replyApiStartTime = $enableTimeCount ? microtime(true) : 0;
+        $rawReply = $ai->generateReply($replyFunction, '', $prompt, $replyMessages);
+        if ($enableTimeCount) {
+            $logger->debug('Reply API调用完成', ['time_spent' => round(microtime(true) - $replyApiStartTime, 3) . 's', 'function' => $replyFunction, 'round' => $round], $chatId);
+        }
+
+        $toolCalls = ($rawReply !== null && $availableTools) ? parse_tool_calls($rawReply, $availableTools) : [];
+        if (!$toolCalls) {
+            break;
+        }
+
+        $replyMessages[] = ['role' => 'assistant', 'content' => $rawReply];
+        if ($round >= $maxToolRounds) {
+            $replyMessages[] = ['role' => 'user', 'content' => "[TOOL_LIMIT] 工具调用次数已用完，不要再调用工具，请直接按输出协议给出最终回复。"];
+            $rawReply = $ai->generateReply($replyFunction, '', $prompt, $replyMessages);
+            break;
+        }
+
+        $logger->info('回复模型请求调用工具', ['round' => $round, 'tools' => $toolCalls], $chatId);
+        $toolResults = [];
+        $httpCalls = [];
+        foreach ($toolCalls as $call) {
+            if ($call['tool'] !== 'DRAW') {
+                $httpCalls[] = $call;
+                continue;
+            }
+            if ($generatedImage !== null) {
+                $toolResults[] = ['tool_name' => 'DRAW', 'query' => $call['query'], 'result' => '每次回复只能生成一张图片，已忽略。'];
+                continue;
+            }
+            $tg->sendChatAction($chatId, 'upload_photo');
+            $generatedImage = $imageService->generate($call['query']);
+            $drawPrompt = $call['query'];
+            $toolResults[] = [
+                'tool_name' => 'DRAW',
+                'query' => $call['query'],
+                'result' => $generatedImage ? '图片已生成，会和你的最终回复一起发送，回复内容会作为图片说明，请保持简短。' : '图片生成失败，请在回复中告知用户。',
+            ];
+        }
+        if ($httpCalls) {
+            $executed = $toolExecutor->execute($httpCalls, $chatId, $userId);
+            if (!$executed) {
+                $executed = [['tool_name' => 'ERROR', 'query' => '', 'result' => '工具执行失败或未配置。']];
+            }
+            $toolResults = array_merge($toolResults, $executed);
+        }
+
+        $replyMessages[] = [
+            'role' => 'user',
+            'content' => "[TOOL_RESULTS]\n" . json_encode($toolResults, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)
+                . "\n请根据以上结果继续：仍需信息可以再次调用工具，否则按输出协议给出最终回复。",
+        ];
     }
 
     if ($rawReply === null || trim($rawReply) === '') {
@@ -396,12 +458,26 @@ function handle_message(array $message, array $config, Logger $logger): void
         : $messageId;
 
     $sendStartTime = $enableTimeCount ? microtime(true) : 0;
-    $sentMessage = $tg->sendMessage($chatId, $replyText, [
-        'reply_parameters' => [
-            'message_id' => $finalReplyTargetId,
-            'allow_sending_without_reply' => true,
-        ],
-    ]);
+    $replyParameters = [
+        'message_id' => $finalReplyTargetId,
+        'allow_sending_without_reply' => true,
+    ];
+    if ($generatedImage !== null) {
+        // 图片说明最长 1024 字符，超出时图片和文字分开发送
+        $captionFits = mb_strlen($replyText) <= 1024;
+        $sentMessage = $tg->sendPhoto($chatId, $generatedImage['content'], $generatedImage['mime'], array_filter([
+            'caption' => $captionFits ? $replyText : null,
+            'reply_parameters' => $replyParameters,
+        ]));
+        if (!$sentMessage) {
+            $logger->error('发送生成的图片失败，改为只发送文字', [], $chatId);
+        }
+        if (!$sentMessage || !$captionFits) {
+            $sentMessage = $tg->sendMessage($chatId, $replyText, ['reply_parameters' => $replyParameters]) ?? $sentMessage;
+        }
+    } else {
+        $sentMessage = $tg->sendMessage($chatId, $replyText, ['reply_parameters' => $replyParameters]);
+    }
 
     if ($sentMessage) {
         $totalReplyTime = isset($replyStartTime) ? round(microtime(true) - $replyStartTime, 2) : -1;
@@ -416,7 +492,9 @@ function handle_message(array $message, array $config, Logger $logger): void
         if (isset($sentMessage['result']['message_id'])) {
             $botMessage = [
                 'role' => 'assistant',
-                'content' => $rawReply,
+                'content' => $drawPrompt !== null && $generatedImage !== null
+                    ? $rawReply . "\n[已随回复发送一张生成的图片，提示词: {$drawPrompt}]"
+                    : $rawReply,
                 'uid' => $config['telegram']['bot_id'],
                 'username' => $botUsername,
                 'full_name' => 'Bot',
@@ -468,6 +546,64 @@ function build_reply_messages(array $context): array
 }
 
 /**
+ * 根据配置返回当前可用的工具列表
+ */
+function get_available_tools(array $config, ToolService $toolService, ImageService $imageService): array
+{
+    $tools = [];
+    if ($toolService->getSearchProvider() !== null) {
+        $tools[] = 'SEARCH';
+        if (!empty($config['worker']['curl_url'])) {
+            $tools[] = 'FETCH';
+        }
+    }
+    if ($imageService->isEnabled()) {
+        $tools[] = 'DRAW';
+    }
+    return $tools;
+}
+
+function build_tool_instructions(array $tools): string
+{
+    $descriptions = [
+        'SEARCH' => '- SEARCH: 联网搜索。涉及新闻、实时信息、价格、版本号或你不确定的事实时使用。query 为简洁的搜索关键词。',
+        'FETCH' => '- FETCH: 抓取网页正文。query 为完整的 http(s) URL，可用于阅读搜索结果或用户发来的链接。',
+        'DRAW' => '- DRAW: 生成一张图片，仅在用户明确要求画图/生成图片时使用。query 为详细的英文画面描述。',
+    ];
+    $lines = array_map(static fn($t) => $descriptions[$t], $tools);
+
+    return "## 工具调用\n"
+        . "需要使用工具时，本次只输出一个或多个工具调用，不要输出 <response>，格式如下 (每个工具调用一行)：\n"
+        . '<tool_call>{"tool": "SEARCH", "query": "关键词"}</tool_call>' . "\n"
+        . "系统执行后会以 [TOOL_RESULTS] 把结果发给你，你再按输出协议给出最终回复。单次最多调用 3 个工具，不需要工具时直接回复。\n"
+        . "可用工具：\n" . implode("\n", $lines);
+}
+
+/**
+ * 从模型输出中解析 <tool_call>，只保留可用工具，最多 3 个
+ *
+ * @return array<array{tool: string, query: string}>
+ */
+function parse_tool_calls(string $raw, array $availableTools): array
+{
+    if (!preg_match_all('/<tool_call>\s*(.*?)\s*<\/tool_call>/is', $raw, $matches)) {
+        return [];
+    }
+
+    $calls = [];
+    foreach ($matches[1] as $json) {
+        $json = preg_replace('/^```[a-z]*\s*|\s*```$/i', '', $json);
+        $data = json_decode($json, true);
+        $tool = strtoupper((string)($data['tool'] ?? ''));
+        $query = trim((string)($data['query'] ?? ''));
+        if ($query !== '' && in_array($tool, $availableTools, true)) {
+            $calls[] = ['tool' => $tool, 'query' => $query];
+        }
+    }
+    return array_slice($calls, 0, 3);
+}
+
+/**
  * 解析回复模型输出的 XML 数据包，兼容模型未遵守协议直接输出纯文本的情况
  *
  * @return array{text: string, target: ?int}
@@ -483,7 +619,8 @@ function parse_reply(string $raw): array
         || preg_match('/<reply_content>(.*?)<\/reply_content>/is', $raw, $m)) {
         $text = $m[1];
     } else {
-        $text = preg_replace('/^```[a-z]*\s*|\s*```$/i', '', trim($raw));
+        $text = preg_replace('/<tool_call>.*?<\/tool_call>/is', '', $raw);
+        $text = preg_replace('/^```[a-z]*\s*|\s*```$/i', '', trim($text));
         $text = strip_tags(preg_replace('/<target_message_id>.*?<\/target_message_id>/is', '', $text));
     }
 

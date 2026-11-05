@@ -234,8 +234,37 @@ return [
         'system_prompt_path' => __DIR__ . '/system_prompt',
     ],
     
-    //不用管这个
-   'tools' => [],
+    // ----------------
+    // 工具 (联网搜索 / 画图)
+    // ----------------
+    'tools' => [
+        // 单次回复中最多进行几轮工具调用
+        'max_rounds' => 3,
+
+        // 联网搜索。provider 留空表示关闭
+        'search' => [
+            // 'tavily' (https://tavily.com，有免费额度) 或 'searxng' (自建 SearxNG，需开启 json 格式)
+            'provider' => '',
+            'tavily_api_key' => '',
+            'searxng_url' => '',
+            // 交给模型的搜索结果条数
+            'max_results' => 5,
+        ],
+
+        // 画图。使用 OpenAI 兼容的 /images/generations 接口
+        'image_generation' => [
+            'enabled' => false,
+            'endpoint' => 'https://api.openai.com/v1/images/generations',
+            'api_key' => '',
+            'model' => 'gpt-image-1',
+            // 不支持 size 参数的接口填 null
+            'size' => '1024x1024',
+            // 额外请求参数，原样合并进请求体。
+            // 例如 SiliconFlow: 'size' => null, 'extra_params' => ['image_size' => '1024x1024']
+            'extra_params' => [],
+            'timeout' => 120,
+        ],
+    ],
     
     // ----------------
     // 通用API密钥配置
