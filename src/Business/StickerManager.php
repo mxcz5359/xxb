@@ -16,6 +16,7 @@ use ChatBot\Services\TelegramAPI;
 class StickerManager
 {
     private const SET_CACHE_TTL = 86400;
+    private const SET_RETRY_AFTER = 600;
 
     private KVStoreInterface $db;
     private TelegramAPI $tg;
@@ -44,22 +45,26 @@ class StickerManager
             return;
         }
 
-        $key = $this->getChatKey($chatId);
-        $stickers = $this->db->get($key);
-        $stickers = is_array($stickers) ? $stickers : [];
         $uniqueId = $sticker['file_unique_id'] ?? $sticker['file_id'];
-        $stickers = array_values(array_filter($stickers, static fn($s) => ($s['file_unique_id'] ?? '') !== $uniqueId));
-        $stickers[] = [
+        $entry = [
             'file_id' => $sticker['file_id'],
             'file_unique_id' => $uniqueId,
             'emoji' => $sticker['emoji'] ?? '',
         ];
+        $max = max(1, (int)($this->config['max_learned'] ?? 200));
 
-        $max = (int)($this->config['max_learned'] ?? 200);
-        if (count($stickers) > $max) {
-            $stickers = array_slice($stickers, -$max);
+        try {
+            $this->db->update($this->getChatKey($chatId), static function ($stickers) use ($entry, $uniqueId, $max) {
+                $stickers = array_values(array_filter(
+                    is_array($stickers) ? $stickers : [],
+                    static fn($s) => ($s['file_unique_id'] ?? '') !== $uniqueId
+                ));
+                $stickers[] = $entry;
+                return array_slice($stickers, -$max);
+            });
+        } catch (\Throwable $e) {
+            $this->logger?->error('StickerManager: 记录贴纸失败', ['error' => $e->getMessage()], $chatId);
         }
-        $this->db->set($key, $stickers);
     }
 
     /**
@@ -104,15 +109,23 @@ class StickerManager
 
     private function getStickers(int $chatId): array
     {
-        $stickers = [];
+        $all = [];
         foreach ($this->config['sets'] ?? [] as $setName) {
-            $stickers = array_merge($stickers, $this->loadSet((string)$setName));
+            $all = array_merge($all, $this->loadSet((string)$setName));
         }
         $learned = $this->db->get($this->getChatKey($chatId));
         if (is_array($learned)) {
-            $stickers = array_merge($stickers, $learned);
+            $all = array_merge($all, $learned);
         }
-        return $stickers;
+
+        // 贴纸包和群友贴纸可能有重复，按 file_unique_id 去重
+        $stickers = [];
+        foreach ($all as $sticker) {
+            if (!empty($sticker['file_id'])) {
+                $stickers[$sticker['file_unique_id'] ?? $sticker['file_id']] = $sticker;
+            }
+        }
+        return array_values($stickers);
     }
 
     /**
@@ -122,14 +135,22 @@ class StickerManager
     {
         $key = "sticker_set_{$name}";
         $cached = $this->db->get($key);
-        if (is_array($cached) && time() - (int)($cached['fetched_at'] ?? 0) < self::SET_CACHE_TTL) {
+        if (is_array($cached) && time() < (int)($cached['expires_at'] ?? 0)) {
             return $cached['stickers'] ?? [];
         }
 
         $response = $this->tg->getStickerSet($name);
         if (!isset($response['result']['stickers']) || !is_array($response['result']['stickers'])) {
-            $this->logger?->warning('StickerManager: 获取贴纸包失败', ['set' => $name]);
-            return is_array($cached) ? ($cached['stickers'] ?? []) : [];
+            // 失败时沿用旧缓存，并且 10 分钟内不再重试，避免每次回复都卡在这个请求上
+            $this->logger?->warning('StickerManager: 获取贴纸包失败，请检查 stickers.sets 里的名字', ['set' => $name]);
+            $stickers = is_array($cached) ? ($cached['stickers'] ?? []) : [];
+            $this->db->set($key, ['expires_at' => time() + self::SET_RETRY_AFTER, 'stickers' => $stickers]);
+            return $stickers;
+        }
+        if (($response['result']['sticker_type'] ?? 'regular') !== 'regular') {
+            $this->logger?->warning('StickerManager: 只支持普通贴纸包，不支持自定义 emoji 包', ['set' => $name]);
+            $this->db->set($key, ['expires_at' => time() + self::SET_CACHE_TTL, 'stickers' => []]);
+            return [];
         }
 
         $stickers = array_map(static fn($s) => [
@@ -137,7 +158,7 @@ class StickerManager
             'file_unique_id' => $s['file_unique_id'] ?? $s['file_id'],
             'emoji' => $s['emoji'] ?? '',
         ], $response['result']['stickers']);
-        $this->db->set($key, ['fetched_at' => time(), 'stickers' => $stickers]);
+        $this->db->set($key, ['expires_at' => time() + self::SET_CACHE_TTL, 'stickers' => $stickers]);
         return $stickers;
     }
 

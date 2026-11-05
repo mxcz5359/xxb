@@ -34,9 +34,9 @@ class TelegramAPI
     /**
      * 发送"正在输入/正在上传图片"等状态
      */
-    public function sendChatAction(int $chatId, string $action): ?array
+    public function sendChatAction(int $chatId, string $action, array $options = []): ?array
     {
-        return $this->request('sendChatAction', ['chat_id' => $chatId, 'action' => $action]);
+        return $this->request('sendChatAction', array_merge(['chat_id' => $chatId, 'action' => $action], $options));
     }
 
     /**

@@ -51,15 +51,20 @@ class ToolService
         return $ch;
     }
 
-    public function processFetchUrlResult(string $responseJson, string $url, string $error): string
+    public function processFetchUrlResult($responseJson, string $url, string $error, int $httpCode = 200): string
     {
-        if ($responseJson === false) {
-            $this->logger?->error('ToolService: 调用 cURL worker 失败', ['url' => $url, 'error' => $error]);
-            return "抓取失败: " . $error;
+        if (!is_string($responseJson) || $responseJson === '') {
+            $this->logger?->error('ToolService: 调用 cURL worker 失败', ['url' => $url, 'error' => $error, 'http_code' => $httpCode]);
+            return "抓取失败: " . ($error ?: "HTTP {$httpCode}");
         }
 
         $response = json_decode($responseJson, true);
-        return $response['content'] ?? "抓取成功，但未能提取有效内容。";
+        if ($httpCode !== 200) {
+            $this->logger?->warning('ToolService: 网页抓取失败', ['url' => $url, 'http_code' => $httpCode, 'response' => mb_substr($responseJson, 0, 300)]);
+            return "抓取失败: " . (is_array($response) ? (string)($response['error'] ?? "HTTP {$httpCode}") : trim(strip_tags($responseJson)));
+        }
+        $content = is_array($response) ? trim((string)($response['content'] ?? '')) : '';
+        return $content !== '' ? $content : "抓取成功，但未能提取有效内容。";
     }
 
     public function fetchUrl(string $url): ?string
@@ -74,9 +79,10 @@ class ToolService
 
         $responseJson = curl_exec($ch);
         $error = curl_error($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
 
-        return $this->processFetchUrlResult($responseJson, $url, $error);
+        return $this->processFetchUrlResult($responseJson, $url, $error, $httpCode);
     }
 
     /**

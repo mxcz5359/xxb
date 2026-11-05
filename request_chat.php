@@ -40,6 +40,10 @@ $config = require __DIR__ . '/config.php';
 
 $logger = new Logger($config['log']);
 
+// main_chat.php 派发任务后 1 秒就断开连接，回复 (含搜索/画图) 可能耗时数分钟，不能随连接中断
+ignore_user_abort(true);
+set_time_limit(0);
+
 
 if (php_sapi_name() === 'cli' || !isset($_SERVER['REQUEST_METHOD'])) {
     // cron task
@@ -160,7 +164,7 @@ function handle_message(array $message, array $config, Logger $logger): void
     if (isset($message['reply_to_message'])) {
         $replyTo = $message['reply_to_message'];
         $formattedMessage['reply_to'] = [
-            'uid' => $replyTo['from']['id'],
+            'uid' => $replyTo['from']['id'] ?? null,
             'username' => $replyTo['from']['username'] ?? '',
             'full_name' => trim(($replyTo['from']['first_name'] ?? '') . ' ' . ($replyTo['from']['last_name'] ?? '')),
             'content_message_id' => $replyTo['message_id'],
@@ -260,6 +264,11 @@ function handle_message(array $message, array $config, Logger $logger): void
         $recentContext = array_slice($context, -$judgeWindowSize);
         
         $judgeInput = [
+            'bot_profile' => [
+                'uid' => $config['telegram']['bot_id'] ?? null,
+                'username' => $botUsername,
+                'nicknames' => $config['telegram']['bot_nicknames'] ?? [],
+            ],
             'knowledge_base' => $knowledgeForJudge,
             'chat_history' => $recentContext,
             'latest_message' => $formattedMessage,
@@ -283,12 +292,7 @@ function handle_message(array $message, array $config, Logger $logger): void
         }
         
         if ($rawAction) {
-            if (preg_match('/\{[^}]*"ACTION"\s*:\s*"([^"]+)"[^}]*\}/i', $rawAction, $matches)) {
-                $action = strtoupper(trim($matches[1]));
-                $logger->debug('从JSON格式中提取到action', ['raw' => $rawAction, 'extracted' => $action], $chatId);
-            } else {
-                $action = trim(strtoupper($rawAction), " \t\n\r\0\x0B`");
-            }
+            $action = parse_judge_action($rawAction);
             
             if (!in_array($action, ['REJECT', 'REPLY', 'REPLY_PRO', 'IGNORE'])) {
                 $logger->warning('Judge返回了无效的action，使用默认值IGNORE', ['invalid_action' => $action, 'raw' => $rawAction], $chatId);
@@ -297,6 +301,12 @@ function handle_message(array $message, array $config, Logger $logger): void
         } else {
             $action = 'IGNORE';
         }
+    }
+
+    // 被点名 (昵称 / @用户名) 或被回复时必须回复，不完全依赖 judge 模型
+    if ($action === 'IGNORE' && is_bot_addressed($formattedMessage, $config['telegram'])) {
+        $logger->info('消息点名或回复了 bot，judge 返回 IGNORE，改为 REPLY', [], $chatId);
+        $action = 'REPLY';
     }
 
     if ($enableTimeCount) {
@@ -393,6 +403,11 @@ function handle_message(array $message, array $config, Logger $logger): void
         $prompt .= "\n\n" . build_tool_instructions($availableTools);
     }
 
+    // 论坛 (话题) 群里不带 reply_parameters 发送时需要指定话题，否则会发到 General
+    $threadOptions = (!empty($message['is_topic_message']) && isset($message['message_thread_id']))
+        ? ['message_thread_id' => (int)$message['message_thread_id']]
+        : [];
+
     // 工具调用循环：模型输出 <tool_call> 时执行工具并把结果回传，直到模型给出最终回复
     $maxToolRounds = max(0, (int)($config['tools']['max_rounds'] ?? 3));
     $generatedImage = null;
@@ -428,7 +443,7 @@ function handle_message(array $message, array $config, Logger $logger): void
                 $toolResults[] = ['tool_name' => 'DRAW', 'query' => $call['query'], 'result' => '每次回复只能生成一张图片，已忽略。'];
                 continue;
             }
-            $tg->sendChatAction($chatId, 'upload_photo');
+            $tg->sendChatAction($chatId, 'upload_photo', $threadOptions);
             $generatedImage = $imageService->generate($call['query']);
             $drawPrompt = $call['query'];
             $toolResults[] = [
@@ -458,7 +473,7 @@ function handle_message(array $message, array $config, Logger $logger): void
     }
 
     $parsedReply = parse_reply($rawReply);
-    $replyText = mb_substr($parsedReply['text'], 0, 4096);
+    $replyText = tg_truncate($parsedReply['text'], 4096);
     $stickerFileId = ($stickerEmojis && $parsedReply['sticker'] !== null)
         ? $stickerManager->pick($chatId, $parsedReply['sticker'])
         : null;
@@ -483,7 +498,7 @@ function handle_message(array $message, array $config, Logger $logger): void
     $sentMessage = null;
     if ($generatedImage !== null) {
         // 图片说明最长 1024 字符，超出时图片和文字分开发送
-        $captionFits = mb_strlen($replyText) <= 1024;
+        $captionFits = tg_length($replyText) <= 1024;
         $sentMessage = $tg->sendPhoto($chatId, $generatedImage['content'], $generatedImage['mime'], array_filter([
             'caption' => ($captionFits && $replyText !== '') ? $replyText : null,
             'reply_parameters' => $replyParameters,
@@ -501,7 +516,7 @@ function handle_message(array $message, array $config, Logger $logger): void
     $sentSticker = null;
     if ($stickerFileId !== null) {
         // 已经发了文字/图片时表情包紧跟其后，否则表情包直接回复目标消息
-        $sentSticker = $tg->sendSticker($chatId, $stickerFileId, $sentMessage ? [] : ['reply_parameters' => $replyParameters]);
+        $sentSticker = $tg->sendSticker($chatId, $stickerFileId, $sentMessage ? $threadOptions : ['reply_parameters' => $replyParameters]);
         $sentMessage = $sentMessage ?? $sentSticker;
     }
 
@@ -574,6 +589,71 @@ function build_reply_messages(array $context): array
         $messages[] = ['role' => 'user', 'content' => $content];
     }
     return $messages;
+}
+
+/**
+ * 解析 judge 输出，兼容 JSON、<think> 推理过程和多余文字
+ */
+function parse_judge_action(string $raw): string
+{
+    $raw = preg_replace('/<think>.*?<\/think>/is', '', $raw);
+    if (preg_match('/"ACTION"\s*:\s*"([A-Z_]+)"/i', $raw, $m)) {
+        return strtoupper($m[1]);
+    }
+    if (preg_match_all('/\b(REPLY_PRO|REPLY|IGNORE|REJECT)\b/i', $raw, $m)) {
+        return strtoupper(end($m[1]));
+    }
+    return trim(strtoupper($raw), " \t\n\r\0\x0B`");
+}
+
+/**
+ * 消息是否点名 (昵称 / @用户名) 或回复了 bot
+ */
+function is_bot_addressed(array $formattedMessage, array $telegramConfig): bool
+{
+    $botId = (int)($telegramConfig['bot_id'] ?? 0);
+    if ($botId !== 0 && (int)($formattedMessage['reply_to']['uid'] ?? 0) === $botId) {
+        return true;
+    }
+
+    $text = mb_strtolower(($formattedMessage['text_content'] ?? '') . ' ' . ($formattedMessage['caption_content'] ?? ''));
+    $names = $telegramConfig['bot_nicknames'] ?? [];
+    $username = ltrim((string)($telegramConfig['bot_username'] ?? ''), '@');
+    if ($username !== '') {
+        $names[] = '@' . $username;
+    }
+    foreach ($names as $name) {
+        $name = mb_strtolower(trim((string)$name));
+        if ($name !== '' && str_contains($text, $name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Telegram 按 UTF-16 码元计算长度 (emoji 等占 2 个)
+ */
+function tg_length(string $text): int
+{
+    return intdiv(strlen(mb_convert_encoding($text, 'UTF-16LE', 'UTF-8')), 2);
+}
+
+function tg_truncate(string $text, int $limit): string
+{
+    if (tg_length($text) <= $limit) {
+        return $text;
+    }
+    $result = '';
+    $units = 0;
+    foreach (mb_str_split($text) as $char) {
+        $units += strlen($char) === 4 ? 2 : 1;
+        if ($units > $limit) {
+            break;
+        }
+        $result .= $char;
+    }
+    return $result;
 }
 
 function build_sticker_instructions(array $emojis): string
