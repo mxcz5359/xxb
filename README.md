@@ -53,10 +53,13 @@ cd xxb
 - 在 `worker.url` 中设置你部署的 `request_chat.php` 的公开访问地址。
 - 根据需要调整 `database` 和 `business` 设置。
 
+- 设置 `worker.secret`（必填，worker 内部调用密钥，可用 `php -r "echo bin2hex(random_bytes(32));"` 生成），未设置时 `request_chat.php` / `request_curl.php` 会拒绝所有请求。
+- 建议设置 `telegram.webhook_secret`，用于校验请求确实来自 Telegram。
+
 ### 4. 设置 Webhook
-将你的 Webhook 地址指向 `main_chat.php`：
+将你的 Webhook 地址指向 `main_chat.php`（`secret_token` 填 `telegram.webhook_secret` 的值）：
 ```text
-https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook?url=https://your-domain.com/main_chat.php
+https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook?url=https://your-domain.com/main_chat.php&secret_token=<YOUR_WEBHOOK_SECRET>
 ```
 
 ## 📂 文件结构简述

@@ -12,6 +12,8 @@ use ChatBot\Core\Logger;
  */
 class AIService
 {
+    private array $labels;
+    private array $usage;
     private ?Logger $logger;
     private TelegramAPI $tg;
     private string $capabilityCacheFile;
