@@ -14,6 +14,9 @@ use RedisException;
  */
 class RedisStore implements KVStoreInterface
 {
+    private const LOCK_TTL_MS = 10000;
+    private const LOCK_WAIT_SECONDS = 10;
+
     private ?Redis $redis;
     private ?Logger $logger;
 
@@ -57,6 +60,38 @@ class RedisStore implements KVStoreInterface
 
         $jsonValue = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         return $this->redis->set($key, $jsonValue);
+    }
+
+    public function update(string $key, callable $callback)
+    {
+        if (!$this->redis) {
+            throw new \RuntimeException('RedisStore: Redis 未连接');
+        }
+
+        // 互斥锁：SET NX PX 加锁，超时自动释放，避免进程崩溃导致死锁
+        $lockKey = "lock:{$key}";
+        $token = bin2hex(random_bytes(16));
+        $deadline = microtime(true) + self::LOCK_WAIT_SECONDS;
+        while (!$this->redis->set($lockKey, $token, ['nx', 'px' => self::LOCK_TTL_MS])) {
+            if (microtime(true) >= $deadline) {
+                throw new \RuntimeException("RedisStore: 获取锁超时: {$key}");
+            }
+            usleep(random_int(5000, 20000));
+        }
+
+        try {
+            $raw = $this->redis->get($key);
+            $newValue = $callback($raw ? json_decode($raw, true) : null);
+            $this->redis->set($key, json_encode($newValue, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+            return $newValue;
+        } finally {
+            // 只释放自己持有的锁
+            $this->redis->eval(
+                "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+                [$lockKey, $token],
+                1
+            );
+        }
     }
 
     public function delete(string $key): bool

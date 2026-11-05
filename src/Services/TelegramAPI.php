@@ -34,9 +34,9 @@ class TelegramAPI
     /**
      * 发送"正在输入/正在上传图片"等状态
      */
-    public function sendChatAction(int $chatId, string $action): ?array
+    public function sendChatAction(int $chatId, string $action, array $options = []): ?array
     {
-        return $this->request('sendChatAction', ['chat_id' => $chatId, 'action' => $action]);
+        return $this->request('sendChatAction', array_merge(['chat_id' => $chatId, 'action' => $action], $options));
     }
 
     /**
@@ -50,6 +50,22 @@ class TelegramAPI
             $fields[$key] = is_array($value) ? json_encode($value, JSON_UNESCAPED_UNICODE) : (string)$value;
         }
         return $this->request('sendPhoto', $fields, true, 60);
+    }
+
+    /**
+     * 发送贴纸 (表情包)
+     */
+    public function sendSticker(int $chatId, string $fileId, array $options = []): ?array
+    {
+        return $this->request('sendSticker', array_merge(['chat_id' => $chatId, 'sticker' => $fileId], $options));
+    }
+
+    /**
+     * 获取贴纸包
+     */
+    public function getStickerSet(string $name): ?array
+    {
+        return $this->request('getStickerSet', ['name' => $name]);
     }
 
     /**

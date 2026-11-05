@@ -29,6 +29,7 @@ $services = require_once __DIR__ . '/bootstrap.php';
 
 use ChatBot\Business\ContextManager;
 use ChatBot\Database\FileStore;
+use ChatBot\Database\RedisStore;
 use ChatBot\Core\Logger;
 
 // 从引导文件中获取核心服务实例
@@ -54,7 +55,9 @@ if (empty($reportChatIds)) {
 }
 
 // 手动实例化服务，因为没有DI容器
-$db = new FileStore($config['database']['file'], $logger);
+$db = (($config['database']['driver'] ?? 'file') === 'redis')
+    ? new RedisStore($config['database']['redis'], $logger)
+    : new FileStore($config['database']['file'], $logger);
 $contextManager = new ContextManager($db, $config['context'], $logger);
 
 // 如果启用了Token估算，则预先加载提示词

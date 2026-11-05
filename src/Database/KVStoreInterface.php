@@ -43,4 +43,13 @@ interface KVStoreInterface
      * @return bool
      */
     public function exists(string $key): bool;
+
+    /**
+     * 原子地读取-修改-写入一个键，期间阻止其他进程并发修改
+     *
+     * @param string $key 键名
+     * @param callable $callback 接收当前值 (不存在时为 null)，返回要写入的新值
+     * @return mixed 写入的新值
+     */
+    public function update(string $key, callable $callback);
 }

@@ -30,6 +30,44 @@ class FileStore implements KVStoreInterface
 
     public function get(string $key)
     {
+        return $this->withLock($key, LOCK_SH, fn() => $this->read($key));
+    }
+
+    public function set(string $key, $value): bool
+    {
+        return $this->withLock($key, LOCK_EX, fn() => $this->write($key, $value));
+    }
+
+    public function update(string $key, callable $callback)
+    {
+        return $this->withLock($key, LOCK_EX, function () use ($key, $callback) {
+            $newValue = $callback($this->read($key));
+            if (!$this->write($key, $newValue)) {
+                throw new \RuntimeException("FileStore: 写入失败: {$key}");
+            }
+            return $newValue;
+        });
+    }
+
+    public function delete(string $key): bool
+    {
+        return $this->withLock($key, LOCK_EX, function () use ($key) {
+            $filePath = $this->getFilePath($key);
+            if (file_exists($filePath)) {
+                return unlink($filePath);
+            }
+            return true; // 如果文件不存在，也视为成功
+        });
+    }
+
+    public function exists(string $key): bool
+    {
+        $filePath = $this->getFilePath($key);
+        return file_exists($filePath);
+    }
+
+    private function read(string $key)
+    {
         $filePath = $this->getFilePath($key);
         if (!file_exists($filePath)) {
             return null;
@@ -39,35 +77,47 @@ class FileStore implements KVStoreInterface
         return $content ? json_decode($content, true) : null;
     }
 
-    public function set(string $key, $value): bool
+    /**
+     * 先写临时文件再 rename，保证读者不会读到写了一半的文件
+     */
+    private function write(string $key, $value): bool
     {
-        $filePath = $this->getFilePath($key);
         $jsonValue = json_encode($value, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-
-        if (json_last_error() !== JSON_ERROR_NONE) {
+        if ($jsonValue === false) {
             $this->logger?->error('FileStore: JSON 编码失败', ['key' => $key, 'error' => json_last_error_msg()]);
             return false;
         }
 
-        // 使用文件锁防止并发写入冲突
-        $result = file_put_contents($filePath, $jsonValue, LOCK_EX);
-
-        return $result !== false;
-    }
-
-    public function delete(string $key): bool
-    {
         $filePath = $this->getFilePath($key);
-        if (file_exists($filePath)) {
-            return unlink($filePath);
+        $tmpPath = $filePath . '.' . bin2hex(random_bytes(6)) . '.tmp';
+        if (file_put_contents($tmpPath, $jsonValue) === false || !rename($tmpPath, $filePath)) {
+            @unlink($tmpPath);
+            $this->logger?->error('FileStore: 写入文件失败', ['key' => $key, 'path' => $filePath]);
+            return false;
         }
-        return true; // 如果文件不存在，也视为成功
+        return true;
     }
 
-    public function exists(string $key): bool
+    /**
+     * 在键对应的锁文件上加锁后执行回调
+     */
+    private function withLock(string $key, int $lockType, callable $fn)
     {
-        $filePath = $this->getFilePath($key);
-        return file_exists($filePath);
+        $lockPath = $this->getFilePath($key) . '.lock';
+        $handle = fopen($lockPath, 'c');
+        if ($handle === false) {
+            throw new \RuntimeException("FileStore: 无法打开锁文件: {$lockPath}");
+        }
+
+        try {
+            if (!flock($handle, $lockType)) {
+                throw new \RuntimeException("FileStore: 无法获取文件锁: {$lockPath}");
+            }
+            return $fn();
+        } finally {
+            flock($handle, LOCK_UN);
+            fclose($handle);
+        }
     }
 
     /**

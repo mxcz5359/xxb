@@ -103,7 +103,7 @@ class ToolExecutor
                     $processedResult = $this->toolService->processSearchResult($response, $query, $httpCode, $error);
                     break;
                 case 'FETCH':
-                    $processedResult = $this->toolService->processFetchUrlResult($response, $query, $error);
+                    $processedResult = $this->toolService->processFetchUrlResult($response, $query, $error, (int)$httpCode);
                     break;
                 case 'IP_QUALITY':
                     $processedResult = $this->toolService->processQueryIpQualityResult($response, $query, $httpCode, $error);
