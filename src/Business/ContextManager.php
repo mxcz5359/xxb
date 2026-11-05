@@ -46,20 +46,22 @@ class ContextManager
      */
     public function addMessage(int $chatId, array $message): void
     {
-        $context = $this->getContext($chatId);
-        $context[] = $message;
+        $this->db->update($this->getContextKey($chatId), function ($context) use ($chatId, $message) {
+            $context = is_array($context) ? $context : [];
+            $context[] = $message;
 
-        if (count($context) > $this->maxLength) {
-            $this->logger?->info('上下文达到上限，执行清理', [
-                'chat_id' => $chatId,
-                'current_size' => count($context),
-                'max_size' => $this->maxLength
-            ]);
-            // 从数组开头删除最旧的记录
-            $context = array_slice($context, $this->truncateSize);
-        }
+            if (count($context) > $this->maxLength) {
+                $this->logger?->info('上下文达到上限，执行清理', [
+                    'chat_id' => $chatId,
+                    'current_size' => count($context),
+                    'max_size' => $this->maxLength
+                ]);
+                // 从数组开头删除最旧的记录
+                $context = array_slice($context, $this->truncateSize);
+            }
 
-        $this->db->set($this->getContextKey($chatId), $context);
+            return $context;
+        });
     }
 
     /**
