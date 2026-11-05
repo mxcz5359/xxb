@@ -48,7 +48,7 @@ cd xxb
 
 ### 3. 配置文件
 复制 `config.php.example` 为 `config.php`：
-- 设置 `telegram.bot_token` 和 `bot_username`。
+- 设置 `telegram.bot_token`、`bot_id`（token 冒号前面的数字）、`bot_username` 和 `bot_nicknames`。消息里出现昵称或 @用户名、或者回复了 bot 的消息时，bot 一定会回复，所以这几项要填对。
 - 在 `ai_labels` 中配置你的 AI 模型 API 密钥和端点。
 - 在 `worker.url` 中设置你部署的 `request_chat.php` 的公开访问地址。
 - 根据需要调整 `database` 和 `business` 设置。

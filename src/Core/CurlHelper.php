@@ -45,10 +45,9 @@ class CurlHelper
         }
         curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
         
-        // 关键设置：实现异步的关键
-        // CURLOPT_RETURNTRANSFER 设置为 false，脚本不等待响应
-        // CURLOPT_TIMEOUT_MS 设置一个极短的超时，防止阻塞
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, false);
+        // 关键设置：CURLOPT_TIMEOUT_MS 设置一个极短的超时，不等 worker 处理完
+        // RETURNTRANSFER 必须为 true，否则 worker 的响应会混进调用方 (webhook) 的输出
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($ch, CURLOPT_TIMEOUT_MS, $timeout * 1000);
         
         // 在某些环境中，需要忽略 SSL 证书验证
