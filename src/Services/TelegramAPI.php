@@ -53,6 +53,22 @@ class TelegramAPI
     }
 
     /**
+     * 发送贴纸 (表情包)
+     */
+    public function sendSticker(int $chatId, string $fileId, array $options = []): ?array
+    {
+        return $this->request('sendSticker', array_merge(['chat_id' => $chatId, 'sticker' => $fileId], $options));
+    }
+
+    /**
+     * 获取贴纸包
+     */
+    public function getStickerSet(string $name): ?array
+    {
+        return $this->request('getStickerSet', ['name' => $name]);
+    }
+
+    /**
      * 编辑消息文本
      */
     public function editMessageText(int $chatId, int $messageId, string $text, array $options = []): ?array

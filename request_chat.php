@@ -31,6 +31,7 @@ use ChatBot\Business\ContextManager;
 use ChatBot\Business\PersonaManager;
 use ChatBot\Business\SystemPromptManager;
 use ChatBot\Business\KnowledgeBaseManager;
+use ChatBot\Business\StickerManager;
 use ChatBot\Services\ToolService;
 use ChatBot\Services\ToolExecutor;
 use ChatBot\Services\ImageService;
@@ -88,9 +89,11 @@ function initialize_services(array $config, Logger $logger): array
         ? new RedisStore($config['database']['redis'], $logger)
         : new FileStore($config['database']['file'], $logger);
 
+    $tg = new TelegramAPI($config['telegram']['bot_token'], $logger);
+
     return [
         'db' => $db,
-        'tg' => new TelegramAPI($config['telegram']['bot_token'], $logger),
+        'tg' => $tg,
         'ai' => new AIService($config, $logger),
         'contextManager' => new ContextManager($db, $config['context'], $logger),
         'personaManager' => new PersonaManager($config['business'], $logger),
@@ -98,6 +101,7 @@ function initialize_services(array $config, Logger $logger): array
         'toolService' => new ToolService($config, $logger),
         'toolExecutor' => new ToolExecutor(new ToolService($config, $logger), $logger),
         'imageService' => new ImageService($config, $logger),
+        'stickerManager' => new StickerManager($db, $tg, $config, $logger),
         'knowledgeManager' => new KnowledgeBaseManager($config, $logger),
     ];
 }
@@ -130,6 +134,7 @@ function handle_message(array $message, array $config, Logger $logger): void
         $toolService = $services['toolService'];
         $toolExecutor = $services['toolExecutor'];
         $imageService = $services['imageService'];
+        $stickerManager = $services['stickerManager'];
         $knowledgeManager = $services['knowledgeManager'];
 
         $userId = (int)$message['from']['id'];
@@ -211,9 +216,14 @@ function handle_message(array $message, array $config, Logger $logger): void
         }
     }
 
+    if (isset($message['sticker'])) {
+        $formattedMessage['sticker'] = '[表情包] ' . ($message['sticker']['emoji'] ?? '');
+        $stickerManager->remember($chatId, $message['sticker']);
+    }
+
     $hasTextContent = !empty($formattedMessage['text_content']) || !empty($formattedMessage['caption_content']);
     $hasImageContent = ($formattedMessage['image_status'] ?? null) === 'success';
-    if (!$hasTextContent && !$hasImageContent) {
+    if (!$hasTextContent && !$hasImageContent && !isset($formattedMessage['sticker'])) {
         $logger->debug('消息既无文本也无有效图片描述，已忽略', [], $chatId);
         return;
     }
@@ -373,6 +383,11 @@ function handle_message(array $message, array $config, Logger $logger): void
     $replyFunction = ($action === 'REPLY_PRO') ? 'reply_pro' : 'reply';
     $replyMessages = build_reply_messages($localContext);
 
+    $stickerEmojis = $stickerManager->isEnabled() ? $stickerManager->getEmojis($chatId) : [];
+    if ($stickerEmojis) {
+        $prompt .= "\n\n" . build_sticker_instructions($stickerEmojis);
+    }
+
     $availableTools = get_available_tools($config, $toolService, $imageService);
     if ($availableTools) {
         $prompt .= "\n\n" . build_tool_instructions($availableTools);
@@ -444,7 +459,10 @@ function handle_message(array $message, array $config, Logger $logger): void
 
     $parsedReply = parse_reply($rawReply);
     $replyText = mb_substr($parsedReply['text'], 0, 4096);
-    if ($replyText === '') {
+    $stickerFileId = ($stickerEmojis && $parsedReply['sticker'] !== null)
+        ? $stickerManager->pick($chatId, $parsedReply['sticker'])
+        : null;
+    if ($replyText === '' && $stickerFileId === null) {
         $logger->warning('回复内容解析后为空，已放弃发送', ['raw' => $rawReply], $chatId);
         return;
     }
@@ -462,21 +480,29 @@ function handle_message(array $message, array $config, Logger $logger): void
         'message_id' => $finalReplyTargetId,
         'allow_sending_without_reply' => true,
     ];
+    $sentMessage = null;
     if ($generatedImage !== null) {
         // 图片说明最长 1024 字符，超出时图片和文字分开发送
         $captionFits = mb_strlen($replyText) <= 1024;
         $sentMessage = $tg->sendPhoto($chatId, $generatedImage['content'], $generatedImage['mime'], array_filter([
-            'caption' => $captionFits ? $replyText : null,
+            'caption' => ($captionFits && $replyText !== '') ? $replyText : null,
             'reply_parameters' => $replyParameters,
         ]));
         if (!$sentMessage) {
             $logger->error('发送生成的图片失败，改为只发送文字', [], $chatId);
         }
-        if (!$sentMessage || !$captionFits) {
+        if ($replyText !== '' && (!$sentMessage || !$captionFits)) {
             $sentMessage = $tg->sendMessage($chatId, $replyText, ['reply_parameters' => $replyParameters]) ?? $sentMessage;
         }
-    } else {
+    } elseif ($replyText !== '') {
         $sentMessage = $tg->sendMessage($chatId, $replyText, ['reply_parameters' => $replyParameters]);
+    }
+
+    $sentSticker = null;
+    if ($stickerFileId !== null) {
+        // 已经发了文字/图片时表情包紧跟其后，否则表情包直接回复目标消息
+        $sentSticker = $tg->sendSticker($chatId, $stickerFileId, $sentMessage ? [] : ['reply_parameters' => $replyParameters]);
+        $sentMessage = $sentMessage ?? $sentSticker;
     }
 
     if ($sentMessage) {
@@ -490,11 +516,16 @@ function handle_message(array $message, array $config, Logger $logger): void
         $logger->info("成功发送最终AI回复，共用时 {$totalReplyTime} 秒", $logData, $chatId);
         
         if (isset($sentMessage['result']['message_id'])) {
+            $botContent = $rawReply;
+            if ($drawPrompt !== null && $generatedImage !== null) {
+                $botContent .= "\n[已随回复发送一张生成的图片，提示词: {$drawPrompt}]";
+            }
+            if ($sentSticker) {
+                $botContent .= "\n[已发送表情包 {$parsedReply['sticker']}]";
+            }
             $botMessage = [
                 'role' => 'assistant',
-                'content' => $drawPrompt !== null && $generatedImage !== null
-                    ? $rawReply . "\n[已随回复发送一张生成的图片，提示词: {$drawPrompt}]"
-                    : $rawReply,
+                'content' => $botContent,
                 'uid' => $config['telegram']['bot_id'],
                 'username' => $botUsername,
                 'full_name' => 'Bot',
@@ -543,6 +574,14 @@ function build_reply_messages(array $context): array
         $messages[] = ['role' => 'user', 'content' => $content];
     }
     return $messages;
+}
+
+function build_sticker_instructions(array $emojis): string
+{
+    return "## 表情包\n"
+        . "可以在 <response> 里加一个 <sticker>emoji</sticker>，额外发一张表达该情绪的表情包，例如 <sticker>😂</sticker>。\n"
+        . "像群友一样偶尔使用：闲聊、玩梗、吐槽时可以用，严肃问答或长回复不要用。只想发表情包时 reply_content 可以留空。\n"
+        . "只能使用这些 emoji: " . implode(' ', $emojis);
 }
 
 /**
@@ -606,7 +645,7 @@ function parse_tool_calls(string $raw, array $availableTools): array
 /**
  * 解析回复模型输出的 XML 数据包，兼容模型未遵守协议直接输出纯文本的情况
  *
- * @return array{text: string, target: ?int}
+ * @return array{text: string, target: ?int, sticker: ?string}
  */
 function parse_reply(string $raw): array
 {
@@ -615,14 +654,19 @@ function parse_reply(string $raw): array
         $target = (int)$m[1];
     }
 
+    $sticker = null;
+    if (preg_match('/<sticker>\s*(.*?)\s*<\/sticker>/is', $raw, $m) && $m[1] !== '') {
+        $sticker = $m[1];
+    }
+
     if (preg_match('/<reply_content>\s*<!\[CDATA\[(.*?)\]\]>\s*<\/reply_content>/is', $raw, $m)
         || preg_match('/<reply_content>(.*?)<\/reply_content>/is', $raw, $m)) {
         $text = $m[1];
     } else {
-        $text = preg_replace('/<tool_call>.*?<\/tool_call>/is', '', $raw);
+        $text = preg_replace('/<(tool_call|sticker)>.*?<\/\1>/is', '', $raw);
         $text = preg_replace('/^```[a-z]*\s*|\s*```$/i', '', trim($text));
         $text = strip_tags(preg_replace('/<target_message_id>.*?<\/target_message_id>/is', '', $text));
     }
 
-    return ['text' => trim($text), 'target' => $target];
+    return ['text' => trim($text), 'target' => $target, 'sticker' => $sticker];
 }

@@ -15,6 +15,7 @@
 - **多存储驱动**：支持本地文件（JSON）和 Redis 两种存储方式。
 - **联网搜索**：回复模型可按需调用搜索 (Tavily 或自建 SearxNG) 和网页抓取，基于实时信息回答。
 - **画图**：用户要求画图时，回复模型调用 OpenAI 兼容的图片生成接口，把图片和回复一起发到群里。
+- **表情包**：bot 会像群友一样偶尔回一张贴纸，贴纸来自配置的贴纸包和群友发过的贴纸；群友发的贴纸也会记进上下文。
 
 ## 🛜 快速开始
 
@@ -56,6 +57,7 @@ cd xxb
 - 建议设置 `telegram.webhook_secret`，用于校验请求确实来自 Telegram。
 - (可选) 联网搜索：设置 `tools.search.provider` 为 `tavily`（填 `tavily_api_key`）或 `searxng`（填 `searxng_url`，SearxNG 需开启 json 输出）。配置了 `worker.curl_url` 时还会启用网页抓取。
 - (可选) 画图：设置 `tools.image_generation.enabled` 为 `true`，并填写 OpenAI 兼容的 `/images/generations` 接口地址、密钥和模型。
+- (可选) 表情包：设置 `stickers.enabled` 为 `true`，在 `stickers.sets` 填贴纸包名字（`t.me/addstickers/` 后面那段）；开启 `learn_from_chat` 后也会使用群友发过的贴纸。
 
 ### 4. 设置 Webhook
 将你的 Webhook 地址指向 `main_chat.php`（`secret_token` 填 `telegram.webhook_secret` 的值）：
