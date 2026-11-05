@@ -30,6 +30,11 @@ return [
         'bot_nicknames' => ['ccbot'],
         
         'worker_url_research' => '暂未实现的功能',
+
+        // Webhook 密钥 (强烈建议设置)，setWebhook 时通过 secret_token 参数传给 Telegram。
+        // 设置后 main_chat.php 会校验 X-Telegram-Bot-Api-Secret-Token 请求头，拒绝伪造的请求。
+        // 只能包含 A-Z a-z 0-9 _ -，长度 1-256。留空表示不校验。
+        'webhook_secret' => '',
         
     ],
 
@@ -210,6 +215,11 @@ return [
         
         // request_curl.php 的可访问 URL
         'curl_url' => 'https://你部署的URL/request_curl.php',
+
+        // Worker 内部调用密钥 (必填)。main_chat.php / cron 调用 worker 时会带上 X-Worker-Secret 请求头，
+        // request_chat.php 和 request_curl.php 只接受携带正确密钥的请求。未设置时 worker 拒绝所有请求。
+        // 可用 `php -r "echo bin2hex(random_bytes(32));"` 生成。
+        'secret' => '',
     ],
 
     // ----------------

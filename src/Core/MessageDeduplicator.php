@@ -16,7 +16,7 @@ class MessageDeduplicator
     private int $processingWindow;
     private int $chatLockTimeout; // 聊天级别的锁超时时间
     
-    public function __construct(string $lockDir = null, ?Logger $logger = null, int $lockTimeout = 10, int $processingWindow = 5)
+    public function __construct(?string $lockDir = null, ?Logger $logger = null, int $lockTimeout = 10, int $processingWindow = 5)
     {
         $this->lockDir = $lockDir ?? __DIR__ . '/../../storage/locks';
         $this->logger = $logger;

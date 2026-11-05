@@ -21,6 +21,7 @@ spl_autoload_register(function ($class) {
     }
 });
 
+use ChatBot\Core\CurlHelper;
 use ChatBot\Core\Logger;
 use ChatBot\Database\FileStore;
 use ChatBot\Database\RedisStore;
@@ -43,6 +44,10 @@ if (php_sapi_name() === 'cli' || !isset($_SERVER['REQUEST_METHOD'])) {
 } elseif ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     $logger->warning('RequestWorker: 收到非POST请求');
     http_response_code(405);
+    exit;
+} elseif (!CurlHelper::isValidWorkerRequest((string)($config['worker']['secret'] ?? ''))) {
+    $logger->warning('RequestWorker: 拒绝未授权的请求 (请检查 worker.secret 配置)', ['ip' => $_SERVER['REMOTE_ADDR'] ?? '']);
+    http_response_code(403);
     exit;
 }
 
@@ -179,39 +184,18 @@ function handle_message(array $message, array $config, Logger $logger): void
     $photos = $message['photo'] ?? null;
     if ($photos) {
         $fileId = end($photos)['file_id'];
-        $formattedMessage['content_png'] = ['[图片解析中...]'];
         $formattedMessage['image_file_id'] = $fileId;
-        $formattedMessage['image_status'] = 'pending';
-        
-        $hasTextContent = !empty($formattedMessage['text_content']) || !empty($formattedMessage['caption_content']);
-        
-        if ($hasTextContent) {
-            $contextManager->addMessage($chatId, $formattedMessage);
-            $logger->debug('已保存带图片占位符的消息到上下文', ['has_text' => true], $chatId);
-        }
-        
+
         try {
             $imagePrompt = $systemPromptManager->get('describe_image') ?: 'Describe this image in detail.';
             $imageParseStartTime = microtime(true);
             $description = $ai->getImageDescription($fileId, $imagePrompt);
             $imageParseTime = round(microtime(true) - $imageParseStartTime, 3);
-            
+
             if ($description) {
                 $formattedMessage['content_png'] = [$description];
                 $formattedMessage['image_status'] = 'success';
                 $logger->info('图片解析成功', ['parse_time' => $imageParseTime . 's', 'desc_length' => strlen($description)], $chatId);
-                
-                if ($hasTextContent) {
-                    $updatedContext = $contextManager->getContext($chatId);
-                    if (!empty($updatedContext)) {
-                        $lastIndex = count($updatedContext) - 1;
-                        if ($updatedContext[$lastIndex]['message_id'] == $messageId) {
-                            $updatedContext[$lastIndex]['content_png'] = [$description];
-                            $updatedContext[$lastIndex]['image_status'] = 'success';
-                            $logger->debug('图片解析完成，但无法更新已保存的上下文', [], $chatId);
-                        }
-                    }
-                }
             } else {
                 $formattedMessage['content_png'] = ['[图片解析失败]'];
                 $formattedMessage['image_status'] = 'failed';
@@ -222,36 +206,18 @@ function handle_message(array $message, array $config, Logger $logger): void
             $formattedMessage['image_status'] = 'error';
             $logger->error('图片解析发生异常', ['error' => $e->getMessage()], $chatId);
         }
-        
-        if (!$hasTextContent && $formattedMessage['image_status'] !== 'success') {
-            $logger->debug('消息只包含无法解析的图片，已忽略', [], $chatId);
-            return;
-        }
-        
-        $formattedMessage['_already_saved'] = $hasTextContent;
-    } else {
-        $formattedMessage['_already_saved'] = false;
     }
 
-    if (empty($formattedMessage['text_content']) &&
-        empty($formattedMessage['caption_content']) &&
-        (empty($formattedMessage['content_png']) || $formattedMessage['content_png'][0] === '[图片解析失败]' || $formattedMessage['content_png'][0] === '[图片解析异常]')) {
+    $hasTextContent = !empty($formattedMessage['text_content']) || !empty($formattedMessage['caption_content']);
+    $hasImageContent = ($formattedMessage['image_status'] ?? null) === 'success';
+    if (!$hasTextContent && !$hasImageContent) {
         $logger->debug('消息既无文本也无有效图片描述，已忽略', [], $chatId);
         return;
     }
-    
+
     $context = $contextManager->getContext($chatId);
-    
     $contextManager->addMessage($chatId, $formattedMessage);
-    $formattedMessage['_already_saved'] = true;
-    
-    $formattedMessage['_is_current_message'] = true;
-    
-    if ($photos && !$hasTextContent && $formattedMessage['image_status'] === 'pending') {
-        $logger->debug('等待图片解析完成后再进行判定', [], $chatId);
-        return;
-    }
-    
+
     $enableTimeCount = $config['debug']['time_count'] ?? false;
     $judgeStartTime = $enableTimeCount ? microtime(true) : 0;
     $judgePrompt = $systemPromptManager->get('judge');
@@ -356,12 +322,11 @@ function handle_message(array $message, array $config, Logger $logger): void
     $currentMessageFound = false;
     
     foreach ($currentContext as $msg) {
-        $msgCopy = $msg;
-        if (isset($msg['message_id']) && $msg['message_id'] === $messageId) {
-            $msgCopy['_is_current_message'] = true;
+        if (isset($msg['message_id']) && (int)$msg['message_id'] === $messageId && ($msg['role'] ?? '') === 'user') {
+            $msg['_is_current_message'] = true;
             $currentMessageFound = true;
         }
-        $localContext[] = $msgCopy;
+        $localContext[] = $msg;
     }
     
     if (!$currentMessageFound) {
@@ -402,16 +367,41 @@ function handle_message(array $message, array $config, Logger $logger): void
         ], $chatId);
     }
 
-    $sendStartTime = $enableTimeCount ? microtime(true) : 0;
-    if (isset($replyText)) {
-        $sentMessage = $tg->sendMessage($chatId, $replyText, ['reply_to_message_id' => $replyTargetMessageId ?? $messageId]);
-    } elseif ($toolUsed) {
-        $fallbackMessage = "我查看了相关信息，但似乎没有找到可以直接回答您问题的要点。";
-        $sentMessage = $tg->sendMessage($chatId, $fallbackMessage, ['reply_to_message_id' => $messageId]);
-        $replyText = $fallbackMessage;
-    } else {
-        $sentMessage = null;
+    $replyFunction = ($action === 'REPLY_PRO') ? 'reply_pro' : 'reply';
+    $replyMessages = build_reply_messages($localContext);
+    $replyApiStartTime = $enableTimeCount ? microtime(true) : 0;
+    $rawReply = $ai->generateReply($replyFunction, '', $prompt, $replyMessages);
+    if ($enableTimeCount) {
+        $logger->debug('Reply API调用完成', ['time_spent' => round(microtime(true) - $replyApiStartTime, 3) . 's', 'function' => $replyFunction], $chatId);
     }
+
+    if ($rawReply === null || trim($rawReply) === '') {
+        $logger->error('回复模型未返回有效内容', ['function' => $replyFunction], $chatId);
+        return;
+    }
+
+    $parsedReply = parse_reply($rawReply);
+    $replyText = mb_substr($parsedReply['text'], 0, 4096);
+    if ($replyText === '') {
+        $logger->warning('回复内容解析后为空，已放弃发送', ['raw' => $rawReply], $chatId);
+        return;
+    }
+
+    $validMessageIds = array_map(
+        static fn($m) => (int)($m['message_id'] ?? 0),
+        array_filter($currentContext, static fn($m) => ($m['role'] ?? '') === 'user')
+    );
+    $finalReplyTargetId = ($parsedReply['target'] !== null && in_array($parsedReply['target'], $validMessageIds, true))
+        ? $parsedReply['target']
+        : $messageId;
+
+    $sendStartTime = $enableTimeCount ? microtime(true) : 0;
+    $sentMessage = $tg->sendMessage($chatId, $replyText, [
+        'reply_parameters' => [
+            'message_id' => $finalReplyTargetId,
+            'allow_sending_without_reply' => true,
+        ],
+    ]);
 
     if ($sentMessage) {
         $totalReplyTime = isset($replyStartTime) ? round(microtime(true) - $replyStartTime, 2) : -1;
@@ -419,7 +409,7 @@ function handle_message(array $message, array $config, Logger $logger): void
         if ($enableTimeCount) {
             $sendTime = round(microtime(true) - $sendStartTime, 3);
             $logData['send_time'] = $sendTime . 's';
-            $logData['message_length'] = mb_strlen($replyText ?? '');
+            $logData['message_length'] = mb_strlen($replyText);
         }
         $logger->info("成功发送最终AI回复，共用时 {$totalReplyTime} 秒", $logData, $chatId);
         
@@ -447,4 +437,55 @@ function handle_message(array $message, array $config, Logger $logger): void
             ], $chatId);
         }
     }
+}
+
+
+/**
+ * 将上下文转换为回复模型可用的 messages 数组，并标记当前需要回复的消息
+ */
+function build_reply_messages(array $context): array
+{
+    $messages = [];
+    foreach ($context as $msg) {
+        $role = $msg['role'] ?? 'user';
+        if ($role === 'system' || $role === 'assistant') {
+            $content = (string)($msg['content'] ?? '');
+            if ($content !== '') {
+                $messages[] = ['role' => $role, 'content' => $content];
+            }
+            continue;
+        }
+
+        $isCurrent = !empty($msg['_is_current_message']);
+        unset($msg['_is_current_message'], $msg['role'], $msg['image_file_id'], $msg['image_status']);
+        $content = json_encode($msg, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if ($isCurrent) {
+            $content = "[CURRENT_MESSAGE_TO_REPLY]\n" . $content;
+        }
+        $messages[] = ['role' => 'user', 'content' => $content];
+    }
+    return $messages;
+}
+
+/**
+ * 解析回复模型输出的 XML 数据包，兼容模型未遵守协议直接输出纯文本的情况
+ *
+ * @return array{text: string, target: ?int}
+ */
+function parse_reply(string $raw): array
+{
+    $target = null;
+    if (preg_match('/<target_message_id>\s*(-?\d+)\s*<\/target_message_id>/i', $raw, $m)) {
+        $target = (int)$m[1];
+    }
+
+    if (preg_match('/<reply_content>\s*<!\[CDATA\[(.*?)\]\]>\s*<\/reply_content>/is', $raw, $m)
+        || preg_match('/<reply_content>(.*?)<\/reply_content>/is', $raw, $m)) {
+        $text = $m[1];
+    } else {
+        $text = preg_replace('/^```[a-z]*\s*|\s*```$/i', '', trim($raw));
+        $text = strip_tags(preg_replace('/<target_message_id>.*?<\/target_message_id>/is', '', $text));
+    }
+
+    return ['text' => trim($text), 'target' => $target];
 }

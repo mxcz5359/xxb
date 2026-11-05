@@ -42,7 +42,10 @@ class ToolService
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($ch, CURLOPT_POST, true);
         curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode(['url' => $targetUrl]));
-        curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'Content-Type: application/json',
+            'X-Worker-Secret: ' . ($this->config['worker']['secret'] ?? ''),
+        ]);
         curl_setopt($ch, CURLOPT_TIMEOUT, 15);
 
         return $ch;

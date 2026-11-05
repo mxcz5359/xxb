@@ -11,14 +11,24 @@ namespace ChatBot\Core;
 class CurlHelper
 {
     /**
+     * 校验 worker 请求头中的密钥，未配置密钥时一律拒绝
+     */
+    public static function isValidWorkerRequest(string $expectedSecret): bool
+    {
+        $provided = $_SERVER['HTTP_X_WORKER_SECRET'] ?? '';
+        return $expectedSecret !== '' && is_string($provided) && hash_equals($expectedSecret, $provided);
+    }
+
+    /**
      * 发送一个异步的 POST 请求 (即发即忘)
      *
      * @param string $url 请求的 URL
      * @param array $data 要 POST 的数据
      * @param int $timeout 超时时间 (秒)，设置为极短的时间来实现异步效果
+     * @param string $secret worker 密钥，非空时通过 X-Worker-Secret 请求头发送
      * @return bool 是否成功初始化了 cURL 请求
      */
-    public static function sendAsyncPost(string $url, array $data, int $timeout = 1, ?Logger $logger = null): bool
+    public static function sendAsyncPost(string $url, array $data, int $timeout = 1, ?Logger $logger = null, string $secret = ''): bool
     {
         $ch = curl_init();
         if ($ch === false) {
@@ -29,7 +39,11 @@ class CurlHelper
         curl_setopt($ch, CURLOPT_URL, $url);
         curl_setopt($ch, CURLOPT_POST, true);
         curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
-        curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+        $headers = ['Content-Type: application/json'];
+        if ($secret !== '') {
+            $headers[] = 'X-Worker-Secret: ' . $secret;
+        }
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
         
         // 关键设置：实现异步的关键
         // CURLOPT_RETURNTRANSFER 设置为 false，脚本不等待响应

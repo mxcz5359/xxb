@@ -21,8 +21,11 @@ class KnowledgeBaseManager
         $this->logger = $logger;
         
         $this->storagePath = $config['paths']['knowledge_base'] ?? '';
-        if (empty($this->storagePath) || !is_dir($this->storagePath)) {
-            throw new \InvalidArgumentException('Knowledge base path is not configured or is not a valid directory.');
+        if (empty($this->storagePath)) {
+            throw new \InvalidArgumentException('Knowledge base path is not configured.');
+        }
+        if (!is_dir($this->storagePath) && !mkdir($this->storagePath, 0775, true) && !is_dir($this->storagePath)) {
+            throw new \RuntimeException("无法创建知识库目录: {$this->storagePath}");
         }
     }
 

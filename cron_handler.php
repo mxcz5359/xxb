@@ -53,7 +53,7 @@ foreach ($enabledGroups as $chatId) {
         $logger->debug('CronHandler: 派发任务到工作进程', ['task' => $taskType, 'chat_id' => $chatId, 'url' => $workerUrl]);
         
         // 使用异步 "Fire and Forget" 模式派发任务
-        $success = CurlHelper::sendAsyncPost($workerUrl, $payload, 1, $logger);
+        $success = CurlHelper::sendAsyncPost($workerUrl, $payload, 1, $logger, (string)($config['worker']['secret'] ?? ''));
 
         if (!$success) {
             $logger->error('CronHandler: 派发任务失败', ['task' => $taskType, 'chat_id' => $chatId]);

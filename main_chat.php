@@ -21,6 +21,16 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     exit;
 }
 
+$webhookSecret = (string)($config['telegram']['webhook_secret'] ?? '');
+if ($webhookSecret !== '') {
+    $providedSecret = $_SERVER['HTTP_X_TELEGRAM_BOT_API_SECRET_TOKEN'] ?? '';
+    if (!is_string($providedSecret) || !hash_equals($webhookSecret, $providedSecret)) {
+        http_response_code(403);
+        echo json_encode(['ok' => false, 'description' => 'Forbidden']);
+        exit;
+    }
+}
+
 $updateJson = file_get_contents('php://input');
 if (!$updateJson) {
     http_response_code(400); // Bad Request
@@ -35,7 +45,7 @@ if (json_last_error() !== JSON_ERROR_NONE) {
     exit;
 }
 
-$message = $update['message'] ?? $update['edited_message'] ?? null;
+$message = $update['message'] ?? null;
 
 if (
     $message
@@ -56,7 +66,7 @@ if (
         'received_at' => time(),    // 接收时间戳
     ];
 
-    \ChatBot\Core\CurlHelper::sendAsyncPost($workerUrl, $payload);
+    \ChatBot\Core\CurlHelper::sendAsyncPost($workerUrl, $payload, 1, null, (string)($config['worker']['secret'] ?? ''));
 }
 
 http_response_code(200);
