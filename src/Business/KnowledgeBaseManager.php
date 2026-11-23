@@ -91,8 +91,7 @@ class KnowledgeBaseManager
     public function updateKnowledge(int $chatId, string $newKnowledgeMarkdown): void
     {
         $path = $this->getKnowledgePath($chatId);
-        file_put_contents($path, $newKnowledgeMarkdown);
-        $this->logger?->debug('知识库 Markdown 文件已更新', ['chat_id' => $chatId, 'path' => $path], $chatId);
+        file_put_contents($path, $newKnowledgeMarkdown, LOCK_EX);
         $this->logger?->debug('知识库 Markdown 文件已更新', ['chat_id' => $chatId, 'path' => $path], $chatId);
     }
 

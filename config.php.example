@@ -28,6 +28,9 @@ return [
     
         // 机器人的昵称，用于触发强制回复。请使用小写。
         'bot_nicknames' => ['ccbot'],
+
+        // 是否忽略其它 bot 发来的消息（默认 true）。关闭后两个 bot 可能互相回复形成死循环。
+        'ignore_bots' => true,
         
         'worker_url_research' => '暂未实现的功能',
 
@@ -124,12 +127,6 @@ return [
             'database' => 0,
         ],
 
-        //未部署的配置，无视即可
-        'say_hello_timing' => [
-            'min_cooldown' => 7200,  // 2小时
-            'max_cooldown' => 10800, // 3小时
-        ],
-
     ],
 
     // ----------------
@@ -179,14 +176,22 @@ return [
         // 默认的人设 prompt 文件名
         'default_persona_file' => __DIR__ . '/prompt.txt',
 
+        // 主动打招呼 (cron_handler.php 派发 say_hello) 的冷却时间，单位秒。
+        // 每次发送后会随机取 min~max 之间的间隔，避免每次 cron 都发。
+        'say_hello_timing' => [
+            'min_cooldown' => 7200,  // 2小时
+            'max_cooldown' => 10800, // 3小时
+        ],
+
         'chat_configs' => [
             '-114514' => [
                 'enable_cron_update' => true,    // 是否启用知识库定时更新
                 'enable_cron_report' => true,    // 是否启用定时报告
-                // 'models' => [                 // 可选：该群组的自定义模型
-                //     'judge' => 'gpt-4',
-                //     'reply' => 'claude-3-opus-20240229',
-                //     'reply_pro' => 'claude-3-opus-20240229',  // 专业回复模型
+                // 'models' => [                 // 可选：该群组使用的模型标签（ai_labels 的 key，不是模型名）
+                //     'judge' => 'kimi_k2',
+                //     'reply' => 'gemini',
+                //     'reply_pro' => 'gemini',       // 专业回复模型
+                //     'say_hello' => 'kimi_k2',      // 主动打招呼（不填则用 reply）
                 // ],
             ],
         ],

@@ -52,6 +52,14 @@ if (
     && isset($message['chat']['type'])
     && in_array($message['chat']['type'], ['group', 'supergroup'])
 ) {
+    // 默认忽略其它 bot 的消息，避免两个 bot 互相回复形成死循环
+    $from = is_array($message['from'] ?? null) ? $message['from'] : [];
+    if (($config['telegram']['ignore_bots'] ?? true) && !empty($from['is_bot'])) {
+        http_response_code(200);
+        echo json_encode(['ok' => true, 'description' => 'Ignore bot message']);
+        exit;
+    }
+
     //检查群组ID是否在白名单中
     $enabledGroups = $config['telegram']['enabled_groups'] ?? [];
     if (!empty($enabledGroups) && !in_array($message['chat']['id'], $enabledGroups)) {

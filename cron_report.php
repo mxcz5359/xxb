@@ -29,7 +29,7 @@ $services = require_once __DIR__ . '/bootstrap.php';
 
 use ChatBot\Business\ContextManager;
 use ChatBot\Database\FileStore;
-use ChatBot\Core\Logger;
+use ChatBot\Database\RedisStore;
 
 // 从引导文件中获取核心服务实例
 $config = $services['config'];
@@ -54,7 +54,11 @@ if (empty($reportChatIds)) {
 }
 
 // 手动实例化服务，因为没有DI容器
-$db = new FileStore($config['database']['file'], $logger);
+// 之前这里写死了 FileStore，database.driver=redis 时报告永远是 0
+$dbDriver = $config['database']['driver'] ?? 'file';
+$db = ($dbDriver === 'redis')
+    ? new RedisStore($config['database']['redis'], $logger)
+    : new FileStore($config['database']['file'], $logger);
 $contextManager = new ContextManager($db, $config['context'], $logger);
 
 // 如果启用了Token估算，则预先加载提示词
@@ -95,6 +99,8 @@ foreach ($reportChatIds as $chatId) {
         }
 
         $logger->info('群聊数据报告', $reportData);
+        // 日志级别默认是 ERROR，info 会被吞掉；报告直接写 stdout，cron 重定向才能看到
+        echo json_encode($reportData, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . PHP_EOL;
 
     } catch (\Exception $e) {
         $logger->error('Cron Report Job: 处理群聊时发生错误', [

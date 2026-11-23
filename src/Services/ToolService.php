@@ -51,7 +51,7 @@ class ToolService
         return $ch;
     }
 
-    public function processFetchUrlResult(string $responseJson, string $url, string $error): string
+    public function processFetchUrlResult(string|false $responseJson, string $url, string $error): string
     {
         if ($responseJson === false) {
             $this->logger?->error('ToolService: 调用 cURL worker 失败', ['url' => $url, 'error' => $error]);
@@ -118,7 +118,7 @@ class ToolService
     /**
      * 解析SearxNG的cURL响应
      */
-    public function processSearchResult(string $responseJson, string $query, int $httpCode, string $error): string
+    public function processSearchResult(string|false $responseJson, string $query, int $httpCode, string $error): string
     {
         if ($responseJson === false) {
             $this->logger?->error('ToolService: 调用 SearxNG API 失败', ['query' => $query, 'error' => $error]);
@@ -205,7 +205,7 @@ class ToolService
         return $ch;
     }
 
-    public function processQueryIpQualityResult(string $responseJson, string $ip, int $httpCode, string $error): string
+    public function processQueryIpQualityResult(string|false $responseJson, string $ip, int $httpCode, string $error): string
     {
         if ($responseJson === false) {
             $this->logger?->error('ToolService: 调用 IP Quality API 失败', ['ip' => $ip, 'error' => $error]);
@@ -284,7 +284,7 @@ class ToolService
         return $ch;
     }
 
-    public function processAddTimerResult(string $responseJson, array $query, int $httpCode, string $error): string
+    public function processAddTimerResult(string|false $responseJson, array $query, int $httpCode, string $error): string
     {
         if ($responseJson === false) {
             $this->logger?->error('ToolService: Calling Timer API failed', ['query' => $query, 'error' => $error]);
@@ -330,7 +330,7 @@ class ToolService
         return $ch;
     }
 
-    public function processListTimersResult(string $responseJson, array $query, int $httpCode, string $error): string
+    public function processListTimersResult(string|false $responseJson, array $query, int $httpCode, string $error): string
     {
         if ($responseJson === false || $httpCode !== 200) {
             $this->logger?->error('ToolService: Calling Timer API (list) failed', ['query' => $query, 'http_code' => $httpCode, 'error' => $error]);
@@ -381,7 +381,7 @@ class ToolService
         return $ch;
     }
 
-    public function processDeleteTimerResult(string $responseJson, array $query, int $httpCode, string $error): string
+    public function processDeleteTimerResult(string|false $responseJson, array $query, int $httpCode, string $error): string
     {
         if ($responseJson === false || $httpCode !== 200) {
             $this->logger?->error('ToolService: Calling Timer API (delete) failed', ['query' => $query, 'http_code' => $httpCode, 'error' => $error]);
