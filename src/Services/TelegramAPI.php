@@ -79,7 +79,8 @@ class TelegramAPI
         curl_close($ch);
 
         if ($content === false) {
-            $this->logger?->error('TelegramAPI: 下载文件失败', ['url' => $fileUrl, 'error' => $curlError]);
+            // 不要把 $fileUrl 写进日志：URL 里带着 bot token
+            $this->logger?->error('TelegramAPI: 下载文件失败', ['file_id' => $fileId, 'error' => $curlError]);
             return null;
         }
 
@@ -90,7 +91,8 @@ class TelegramAPI
         // 确保返回的是支持的图片类型
         $supportedMimes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
         if (!in_array($mime, $supportedMimes)) {
-            $this->logger?->warning('TelegramAPI: 下载的文件MIME类型不被支持', ['url' => $fileUrl, 'mime' => $mime]);
+            // 同样不要记录 URL，避免 bot token 泄漏到日志
+            $this->logger?->warning('TelegramAPI: 下载的文件MIME类型不被支持', ['file_id' => $fileId, 'mime' => $mime]);
             return null;
         }
 
@@ -117,6 +119,7 @@ class TelegramAPI
         
         $responseJson = curl_exec($ch);
         $curlError = curl_error($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
 
         if ($responseJson === false) {
@@ -126,11 +129,13 @@ class TelegramAPI
 
         $response = json_decode($responseJson, true);
 
-        if (!$response['ok']) {
+        if (!is_array($response) || empty($response['ok'])) {
             $this->logger?->error('TelegramAPI: API 返回错误', [
                 'method' => $method,
+                'http_code' => $httpCode,
                 'error_code' => $response['error_code'] ?? 'N/A',
                 'description' => $response['description'] ?? 'N/A',
+                'body' => is_array($response) ? '' : mb_substr((string)$responseJson, 0, 200),
             ]);
             return null;
         }

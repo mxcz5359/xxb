@@ -71,7 +71,8 @@ class AIService
 
     /**
      * 调用【回复模型】来生成回复内容
-     * 支持自动使用正确的模型标签和备用
+     * 支持自动使用正确的模型标签和备用。
+     * $modelName 非空时作为该次调用的主标签（用于按群覆盖 models），失败后仍走 ai_usage 的 backup。
      */
     public function generateReply(string $function, string $modelName, string $systemPrompt, array $messages, array $options = []): ?string
     {
@@ -111,8 +112,20 @@ class AIService
         // 合并超时设置
         $options['timeout'] = $options['timeout'] ?? $usageConfig['timeout'] ?? 60;
         
-        // 尝试主标签
+        // 尝试主标签。$model 是调用方指定的标签覆盖（例如按群配置的 models），
+        // 只有标签确实存在时才覆盖，否则回退到 ai_usage 里的 label。
         $primaryLabel = $usageConfig['label'];
+        if ($model !== '') {
+            if (isset($this->labels[$model])) {
+                $primaryLabel = $model;
+            } else {
+                $this->logger?->warning('AIService: 指定的模型标签不存在，使用默认标签', [
+                    'label' => $model,
+                    'function' => $function,
+                ]);
+            }
+        }
+
         $result = $this->callByLabel($primaryLabel, $messages, $options);
         
         if ($result !== null) {
@@ -250,7 +263,8 @@ class AIService
             ]
         ];
         
-        return $this->callByLabel($visionLabel, $messages, ['timeout' => $visionUsage['timeout'] ?? 180]);
+        // 走 callWithBackup，主视觉模型失败时会尝试 ai_usage.vision.backup
+        return $this->callWithBackup('vision', $visionLabel, $messages, ['timeout' => $visionUsage['timeout'] ?? 180]);
     }
 
     /**
@@ -353,11 +367,21 @@ class AIService
         
         $cacheKey = hash('sha256', json_encode([$config['endpoint'], $config['api_key'], $config['model']]));
 
-        if (isset($this->runtimeCache[$cacheKey])) {
-            return $this->runtimeCache[$cacheKey];
+        // 只长期缓存“确定支持”的结果；失败结果最多缓存 1 小时。
+        // 旧版本会把一次失败永久写成 false，导致识图能力被永久关闭。
+        $cached = $this->runtimeCache[$cacheKey] ?? null;
+        if ($cached === true || (is_array($cached) && !empty($cached['ok']))) {
+            return true;
+        }
+        if (is_array($cached) && empty($cached['ok']) && (time() - (int)($cached['at'] ?? 0)) < 3600) {
+            return false;
         }
 
+        // 64x64 彩色图。之前用 1x1 PNG，部分中转/模型会直接以 400 拒绝，
+        // 被误判成“不支持识图”。
+        $probeImage = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAiUlEQVR4nNXZwQnAQBDDQK1I4en8UsSxBE0Bwn/PYde8u32JkziJkziJkziJkziJkziJkziJkziJkziJkziJkziJkziJkziJkziJkziJkziJkziJezjLD8Hs5iVO4iRO4iRO4iRO4iRO4iRO4iRO4iRO4iRO4iRO4iRO4iRO4iRO4iRO4vx7wK0PyF8EAYWMM5wAAAAASUVORK5CYII=';
         $prompt = "What is in this image?";
+
         $messages = [
             [
                 'role' => 'user',
@@ -366,7 +390,7 @@ class AIService
                     [
                         'type' => 'image_url',
                         'image_url' => [
-                            'url' => 'data:image/png;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'
+                            'url' => $probeImage
                         ]
                     ]
                 ]
@@ -386,18 +410,35 @@ class AIService
         ]);
         curl_setopt($ch, CURLOPT_TIMEOUT, 10);
 
-        curl_exec($ch);
+        $body = curl_exec($ch);
+        $curlError = curl_error($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
 
-        $isVisionModel = ($httpCode === 200);
-        
-        $this->runtimeCache[$cacheKey] = $isVisionModel;
-        $this->saveCapabilitiesToCache();
-        
-        $this->logger?->info('模型能力检查', ['label' => $label, 'model' => $config['model'], 'vision_enabled' => $isVisionModel, 'http_code' => $httpCode]);
+        if ($httpCode === 200) {
+            $this->runtimeCache[$cacheKey] = true;
+            $this->saveCapabilitiesToCache();
+            $this->logger?->info('模型能力检查', ['label' => $label, 'model' => $config['model'], 'vision_enabled' => true]);
+            return true;
+        }
 
-        return $isVisionModel;
+        // 网络错误（http code 0）不落盘，避免一次断网被当成“不支持识图”。
+        if ($httpCode !== 0) {
+            $this->runtimeCache[$cacheKey] = ['ok' => false, 'at' => time()];
+            $this->saveCapabilitiesToCache();
+        } else {
+            unset($this->runtimeCache[$cacheKey]);
+        }
+
+        $this->logger?->warning('模型能力检查失败', [
+            'label' => $label,
+            'model' => $config['model'],
+            'http_code' => $httpCode,
+            'error' => $curlError,
+            'response' => is_string($body) ? mb_substr($body, 0, 200) : '',
+        ]);
+
+        return false;
     }
 
     private function loadCapabilitiesFromCache(): void
@@ -417,7 +458,7 @@ class AIService
             if (!is_dir($dir)) {
                 mkdir($dir, 0777, true);
             }
-            file_put_contents($this->capabilityCacheFile, json_encode($this->runtimeCache, JSON_PRETTY_PRINT));
+            file_put_contents($this->capabilityCacheFile, json_encode($this->runtimeCache, JSON_PRETTY_PRINT), LOCK_EX);
         }
     }
 }

@@ -67,8 +67,10 @@ class ToolExecutor
 
             if ($ch) {
                 curl_multi_add_handle($multiHandle, $ch);
-                $handles[(int)$ch] = $ch;
-                $callMap[(int)$ch] = $call; // 映射句柄ID到原始调用信息
+                // PHP 8 里 CurlHandle 是对象，不能 (int) 转换（会全部变成 1，互相覆盖）。
+                $handleId = spl_object_id($ch);
+                $handles[$handleId] = $ch;
+                $callMap[$handleId] = $call; // 映射句柄ID到原始调用信息
             }
         }
 
@@ -92,7 +94,7 @@ class ToolExecutor
             $response = curl_multi_getcontent($ch);
             $info = curl_getinfo($ch);
             $error = curl_error($ch);
-            $call = $callMap[(int)$ch];
+            $call = $callMap[spl_object_id($ch)];
             $toolName = $call['tool'];
             $query = $call['query'];
             $httpCode = $info['http_code'] ?? 500;

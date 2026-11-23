@@ -76,6 +76,8 @@ https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook?url=https://your-domain.com/
 - **日志监控**：通过 `logs/` 目录下的日志文件监控运行状态。
 - **定时任务 - **：建议设置 crontab 每15分钟执行一次 `cron_report.php`
 - **定时知识库整理任务**： 设置 `php cron_long_term.php`
+- **主动打招呼**：`cron_handler.php` 派发 `say_hello`，冷却时间由 `business.say_hello_timing` 控制（未配置时默认 2~3 小时），提示词在 `system_prompt/say_hello.txt`。
+- **忽略其它 bot**：`telegram.ignore_bots` 默认为 `true`，避免两个 bot 互相回复形成死循环。
 
 示例配置:
 ```shell

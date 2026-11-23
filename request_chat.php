@@ -38,6 +38,13 @@ $config = require __DIR__ . '/config.php';
 
 $logger = new Logger($config['log']);
 
+// worker 由 main_chat.php 异步拉起，一次回复可能要几分钟。
+// 不加这两行的话，默认 max_execution_time=30 会在 AI 返回前就把进程杀掉。
+if (PHP_SAPI !== 'cli') {
+    ignore_user_abort(true);
+    @set_time_limit(0);
+}
+
 
 if (php_sapi_name() === 'cli' || !isset($_SERVER['REQUEST_METHOD'])) {
     // cron task
@@ -64,6 +71,9 @@ try {
     switch ($payload['type']) {
         case 'handle_message':
             handle_message($payload['data'], $config, $logger);
+            break;
+        case 'say_hello':
+            handle_say_hello($payload['data'], $config, $logger);
             break;
         default:
             $logger->warning('RequestWorker: 未知的任务类型', ['type' => $payload['type']]);
@@ -110,9 +120,25 @@ function handle_message(array $message, array $config, Logger $logger): void
     $processingStartTime = microtime(true);
 
     // 提前获取关键信息
-    $chatId = (int)$message['chat']['id'];
-    $messageId = (int)$message['message_id'];
-    
+    $chatId = (int)($message['chat']['id'] ?? 0);
+    $messageId = (int)($message['message_id'] ?? 0);
+    $from = is_array($message['from'] ?? null) ? $message['from'] : [];
+
+    if ($chatId === 0 || $messageId === 0) {
+        $logger->warning('消息缺少 chat_id/message_id，已忽略', ['message' => $message]);
+        return;
+    }
+
+    // 默认忽略其它 bot 的消息，避免两个 bot 互相回复形成死循环
+    if (($config['telegram']['ignore_bots'] ?? true) && !empty($from['is_bot'])) {
+        $logger->debug('忽略来自其它 bot 的消息', [
+            'chat_id' => $chatId,
+            'message_id' => $messageId,
+            'bot_username' => $from['username'] ?? '',
+        ]);
+        return;
+    }
+
     $logger->debug('开始处理新消息', [
         'chat_id' => $chatId,
         'message_id' => $messageId
@@ -120,25 +146,23 @@ function handle_message(array $message, array $config, Logger $logger): void
 
     // 初始化服务
     $services = initialize_services($config, $logger);
-        $tg = $services['tg'];
-        $ai = $services['ai'];
-        $contextManager = $services['contextManager'];
-        $personaManager = $services['personaManager'];
-        $systemPromptManager = $services['systemPromptManager'];
-        $toolService = $services['toolService'];
-        $toolExecutor = $services['toolExecutor'];
-        $knowledgeManager = $services['knowledgeManager'];
+    $tg = $services['tg'];
+    $ai = $services['ai'];
+    $contextManager = $services['contextManager'];
+    $personaManager = $services['personaManager'];
+    $systemPromptManager = $services['systemPromptManager'];
+    $knowledgeManager = $services['knowledgeManager'];
 
-        $userId = (int)$message['from']['id'];
-        $text = $message['text'] ?? $message['caption'] ?? '';
-        $botUsername = $config['telegram']['bot_username'];
+    $userId = (int)($from['id'] ?? 0);
+    $text = $message['text'] ?? $message['caption'] ?? '';
+    $botUsername = $config['telegram']['bot_username'] ?? '';
 
     $formattedMessage = [
         'role' => 'user',
         'uid' => $userId,
-        'username' => $message['from']['username'] ?? '',
-        'full_name' => trim(($message['from']['first_name'] ?? '') . ' ' . ($message['from']['last_name'] ?? '')),
-        'timestamp' => $message['date'],
+        'username' => $from['username'] ?? '',
+        'full_name' => trim(($from['first_name'] ?? '') . ' ' . ($from['last_name'] ?? '')),
+        'timestamp' => $message['date'] ?? time(),
         'message_id' => $messageId,
     ];
 
@@ -151,11 +175,12 @@ function handle_message(array $message, array $config, Logger $logger): void
 
     if (isset($message['reply_to_message'])) {
         $replyTo = $message['reply_to_message'];
+        $replyFrom = is_array($replyTo['from'] ?? null) ? $replyTo['from'] : [];
         $formattedMessage['reply_to'] = [
-            'uid' => $replyTo['from']['id'],
-            'username' => $replyTo['from']['username'] ?? '',
-            'full_name' => trim(($replyTo['from']['first_name'] ?? '') . ' ' . ($replyTo['from']['last_name'] ?? '')),
-            'content_message_id' => $replyTo['message_id'],
+            'uid' => (int)($replyFrom['id'] ?? 0),
+            'username' => $replyFrom['username'] ?? '',
+            'full_name' => trim(($replyFrom['first_name'] ?? '') . ' ' . ($replyFrom['last_name'] ?? '')),
+            'content_message_id' => (int)($replyTo['message_id'] ?? 0),
         ];
     }
 
@@ -165,7 +190,7 @@ function handle_message(array $message, array $config, Logger $logger): void
         if (isset($message['forward_from'])) {
             $forwardFrom = $message['forward_from'];
             $formattedMessage['forward_from'] = [
-                'uid' => $forwardFrom['id'],
+                'uid' => (int)($forwardFrom['id'] ?? 0),
                 'username' => $forwardFrom['username'] ?? '',
                 'full_name' => trim(($forwardFrom['first_name'] ?? '') . ' ' . ($forwardFrom['last_name'] ?? '')),
             ];
@@ -216,7 +241,8 @@ function handle_message(array $message, array $config, Logger $logger): void
     }
 
     $context = $contextManager->getContext($chatId);
-    $contextManager->addMessage($chatId, $formattedMessage);
+    $chatConfig = $config['business']['chat_configs'][$chatId] ?? [];
+    $chatModels = is_array($chatConfig['models'] ?? null) ? $chatConfig['models'] : [];
 
     $enableTimeCount = $config['debug']['time_count'] ?? false;
     $judgeStartTime = $enableTimeCount ? microtime(true) : 0;
@@ -226,13 +252,10 @@ function handle_message(array $message, array $config, Logger $logger): void
     if (!$judgePrompt || !is_string($judgePrompt)) {
         $logger->error('缺少或无效的判定提示词(judge.txt)，执行默认忽略操作', [], $chatId);
     } else {
-        $chatConfig = $config['business']['chat_configs'][$chatId] ?? [];
-        $chatModels = $chatConfig['models'] ?? [];
-        
         $knowledgeLoadStartTime = $enableTimeCount ? microtime(true) : 0;
         $judgeKnowledgeConfig = $config['business']['judge_uses_knowledge'] ?? ['enabled' => false];
         $knowledgeForJudge = '';
-        if ($judgeKnowledgeConfig['enabled']) {
+        if (!empty($judgeKnowledgeConfig['enabled'])) {
             $knowledgeForJudge = $knowledgeManager->getKnowledge($chatId, [
                 'permanent' => $judgeKnowledgeConfig['permanent'] ?? true,
                 'group' => $judgeKnowledgeConfig['group'] ?? true,
@@ -263,7 +286,8 @@ function handle_message(array $message, array $config, Logger $logger): void
         $judgeMessages = [['role' => 'user', 'content' => $userInput]];
 
         $judgeApiStartTime = $enableTimeCount ? microtime(true) : 0;
-        $rawAction = $ai->generateReply('judge', '', $judgePrompt, $judgeMessages);
+        $judgeLabel = (string)($chatModels['judge'] ?? '');
+        $rawAction = $ai->generateReply('judge', $judgeLabel, $judgePrompt, $judgeMessages);
         if ($enableTimeCount) {
             $judgeApiTime = round(microtime(true) - $judgeApiStartTime, 3);
             $logger->debug('Judge API调用完成', ['time_spent' => $judgeApiTime . 's', 'function' => 'judge'], $chatId);
@@ -293,26 +317,28 @@ function handle_message(array $message, array $config, Logger $logger): void
         $logger->debug('安全与决策判定完成', ['action' => $action], $chatId);
     }
 
-    switch ($action) {
-        case 'REJECT':
-            $logger->warning('检测到注入攻击，消息已丢弃', ['user_id' => $userId, 'text' => $text], $chatId);
-            return;
-        case 'REPLY':
-        case 'REPLY_PRO':
-            $serverResponseTime = round($processingStartTime - $receivedAt, 2);
-            $decisionTime = round(microtime(true) - $processingStartTime, 2);
-            $replyType = ($action === 'REPLY_PRO') ? '专业' : '普通';
-            $logger->info("AI决定{$replyType}回复，服务器响应（{$serverResponseTime} 秒）用时 {$decisionTime} 秒", ['user_id' => $userId, 'action' => $action], $chatId);
-            $replyStartTime = microtime(true);
-            break;
-        case 'IGNORE':
-        default:
-            if ($action !== 'IGNORE') {
-                $logger->warning('收到未知的决策action，执行默认忽略操作', ['action' => $action], $chatId);
-            }
-            $logger->debug('消息已存入上下文，但AI决定不回复', ['user_id' => $userId], $chatId);
-            return;
+    // 先判定再入库：REJECT 的注入消息不应该被写进上下文，
+    // 否则之后每条消息都会把它重新带给 reply 模型。
+    if ($action === 'REJECT') {
+        $logger->warning('检测到注入攻击，消息已丢弃', ['user_id' => $userId, 'text' => $text], $chatId);
+        return;
     }
+
+    $contextManager->addMessage($chatId, $formattedMessage);
+
+    if ($action !== 'REPLY' && $action !== 'REPLY_PRO') {
+        if ($action !== 'IGNORE') {
+            $logger->warning('收到未知的决策action，执行默认忽略操作', ['action' => $action], $chatId);
+        }
+        $logger->debug('消息已存入上下文，但AI决定不回复', ['user_id' => $userId], $chatId);
+        return;
+    }
+
+    $serverResponseTime = round($processingStartTime - $receivedAt, 2);
+    $decisionTime = round(microtime(true) - $processingStartTime, 2);
+    $replyType = ($action === 'REPLY_PRO') ? '专业' : '普通';
+    $logger->info("AI决定{$replyType}回复，服务器响应（{$serverResponseTime} 秒）用时 {$decisionTime} 秒", ['user_id' => $userId, 'action' => $action], $chatId);
+    $replyStartTime = microtime(true);
 
     $replyPrepStartTime = $enableTimeCount ? microtime(true) : 0;
     
@@ -368,9 +394,10 @@ function handle_message(array $message, array $config, Logger $logger): void
     }
 
     $replyFunction = ($action === 'REPLY_PRO') ? 'reply_pro' : 'reply';
+    $replyLabel = (string)($chatModels[$replyFunction] ?? '');
     $replyMessages = build_reply_messages($localContext);
     $replyApiStartTime = $enableTimeCount ? microtime(true) : 0;
-    $rawReply = $ai->generateReply($replyFunction, '', $prompt, $replyMessages);
+    $rawReply = $ai->generateReply($replyFunction, $replyLabel, $prompt, $replyMessages);
     if ($enableTimeCount) {
         $logger->debug('Reply API调用完成', ['time_spent' => round(microtime(true) - $replyApiStartTime, 3) . 's', 'function' => $replyFunction], $chatId);
     }
@@ -439,6 +466,113 @@ function handle_message(array $message, array $config, Logger $logger): void
     }
 }
 
+/**
+ * 处理 cron_handler.php 派发的「主动打招呼」任务。
+ *
+ * 之前 cron 会派发 type=say_hello，但 request_chat.php 只识别 handle_message，
+ * 任务被静默丢弃。这里补上真正的处理逻辑，并按 say_hello_timing 做冷却，
+ * 避免每次 cron 都往群里发一条。
+ */
+function handle_say_hello(array $data, array $config, Logger $logger): void
+{
+    $chatId = (int)($data['chat_id'] ?? 0);
+    if ($chatId === 0) {
+        $logger->warning('SayHello: 缺少有效的 chat_id', ['data' => $data]);
+        return;
+    }
+
+    $services = initialize_services($config, $logger);
+    $db = $services['db'];
+    $tg = $services['tg'];
+    $ai = $services['ai'];
+    $contextManager = $services['contextManager'];
+    $personaManager = $services['personaManager'];
+    $systemPromptManager = $services['systemPromptManager'];
+
+    // 优先读 business.say_hello_timing，兼容旧配置里放在 database 下的写法
+    $timing = $config['business']['say_hello_timing'] ?? $config['database']['say_hello_timing'] ?? [];
+    $minCooldown = max(60, (int)($timing['min_cooldown'] ?? 7200));
+    $maxCooldown = max($minCooldown, (int)($timing['max_cooldown'] ?? 10800));
+
+    $nextKey = "say_hello_next_{$chatId}";
+    $nextAt = (int)($db->get($nextKey) ?? 0);
+    if ($nextAt > time()) {
+        $logger->debug('SayHello: 冷却中，跳过', ['chat_id' => $chatId, 'next_at' => $nextAt]);
+        return;
+    }
+
+    $greetingPrompt = $systemPromptManager->get('say_hello');
+    if (!$greetingPrompt) {
+        $logger->error('SayHello: 缺少 system_prompt/say_hello.txt，任务跳过', [], $chatId);
+        return;
+    }
+
+    $chatConfig = $config['business']['chat_configs'][$chatId] ?? [];
+    $chatModels = is_array($chatConfig['models'] ?? null) ? $chatConfig['models'] : [];
+    $label = (string)($chatModels['say_hello'] ?? $chatModels['reply'] ?? '');
+
+    $windowSize = (int)($config['context']['judge_window_size'] ?? 30);
+    $context = $contextManager->getContext($chatId);
+    $botId = (int)($config['telegram']['bot_id'] ?? 0);
+    $persona = $personaManager->getPrompt($botId);
+    $systemPrompt = trim($persona . "\n\n" . $greetingPrompt);
+
+    try {
+        $now = (new \DateTime('now', new \DateTimeZone('Asia/Shanghai')))->format('Y-m-d H:i:s');
+    } catch (\Exception $e) {
+        $now = gmdate('Y-m-d H:i:s');
+    }
+
+    $userInput = json_encode([
+        'current_time' => $now,
+        'chat_history' => array_slice($context, -$windowSize),
+    ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+
+    $messages = [['role' => 'user', 'content' => $userInput]];
+
+    $startedAt = microtime(true);
+    $raw = $ai->generateReply('reply', $label, $systemPrompt, $messages);
+    if ($raw === null || trim($raw) === '') {
+        $logger->error('SayHello: 模型未返回有效内容', [], $chatId);
+        return;
+    }
+
+    $text = trim(parse_reply($raw)['text']);
+    if ($text === '') {
+        $text = trim(strip_tags($raw));
+    }
+    if ($text === '') {
+        $logger->warning('SayHello: 解析后内容为空，已放弃发送', ['raw' => $raw], $chatId);
+        return;
+    }
+    $text = mb_substr($text, 0, 4096);
+
+    $sent = $tg->sendMessage($chatId, $text);
+    if (!$sent) {
+        $logger->error('SayHello: 发送打招呼消息失败', [], $chatId);
+        return;
+    }
+
+    $db->set($nextKey, time() + random_int($minCooldown, $maxCooldown));
+
+    if (isset($sent['result']['message_id'])) {
+        $contextManager->addMessage($chatId, [
+            'role' => 'assistant',
+            'content' => $text,
+            'uid' => $botId,
+            'username' => (string)($config['telegram']['bot_username'] ?? ''),
+            'full_name' => 'Bot',
+            'timestamp' => time(),
+            'message_id' => (int)$sent['result']['message_id'],
+        ]);
+    }
+
+    $logger->info('SayHello: 主动打招呼已发送', [
+        'chat_id' => $chatId,
+        'time_spent' => round(microtime(true) - $startedAt, 2) . 's',
+        'length' => mb_strlen($text),
+    ], $chatId);
+}
 
 /**
  * 将上下文转换为回复模型可用的 messages 数组，并标记当前需要回复的消息

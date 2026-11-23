@@ -82,6 +82,8 @@ class MessageDeduplicator
                     'message_id' => $messageId,
                     'lock_age' => $currentTime - $lockTime
                 ]);
+                // 这条路径不能把聊天锁留在文件系统里，否则同群消息会一直被阻塞
+                $this->releaseChatLock($chatId);
                 return false;
             }
             
@@ -106,6 +108,7 @@ class MessageDeduplicator
                     'message_id' => $messageId,
                     'window_age' => $currentTime - $processedTime
                 ]);
+                $this->releaseChatLock($chatId);
                 return false;
             }
             

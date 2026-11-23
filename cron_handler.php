@@ -41,6 +41,7 @@ if (empty($enabledGroups)) {
 $logger->debug('CronHandler: 开始为 ' . count($enabledGroups) . ' 个群组派发 ' . count($tasksToDispatch) . ' 种任务。');
 
 foreach ($enabledGroups as $chatId) {
+    $chatId = (int)$chatId;
     foreach ($tasksToDispatch as $taskType) {
         $payload = [
             'type' => $taskType,
